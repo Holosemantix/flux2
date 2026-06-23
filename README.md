@@ -55,5 +55,5 @@ docs/
 
 - **Version A（Expanded-KV Only）**：已实现并实测 → 小脸上无可见作用、被噪声淹没（`docs/05`）。
 - **Version A'（Noise-Fixup）**：已实现并实测 → 输出脸**机械上响应了 ref**(结果与 baseline 有别)，但**清晰度未提升**。结论:路径有效，瓶颈在小脸的细节源/分辨率容量。
-- **Version B（提分辨率/细节容量）**：当前主攻方向。先做 `docs/08` 的 B-0 前提核查(ref 脸是否真更清晰 + 高清 ref crop 概念验证)，再上 B-reencode。
+- **Version B（区域高分辨率精修 + 合成）**：当前主攻方向。实测「同 ID 脸 crop→resize 1024 跑 refiner」清晰度大幅提升 → 瓶颈是输出 token 分辨率，序列内 attention 注入给不出清晰脸(输出仍从 ~10 token 解码)。改走 crop→1024 精修→合成回原图，复用现有 refiner。phase 与合成难点见 `docs/08`。
 - **多 ID 泄漏 mitigation**：已登记后续点(Version B 中每脸独立 crop 天然隔离)。
