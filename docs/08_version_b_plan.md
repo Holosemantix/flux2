@@ -31,6 +31,18 @@ P×P 虚拟 token 要重新给位置 id 并 apply RoPE:
 ## 唯一要盯住的经验性风险（设计实验时直接测,不预设结论）
 ROIAlign 升采样 latent 是**插值**(带限),scatter 回 native 又是**降采样**——**要验证高频在"升采样→attention→降采样"这一来回里是否真的被搬进了 native noise token**,而不是被插值/降采样抹平。你的 crop+1k 证明了"token 多→能迁移",但那是**像素重编码**带来的高密度;latent ROIAlign 是否等效,**Phase B-1 直接用清晰度指标判**。若被抹平,退路是从更高密度特征 ROIAlign(后议),但**先按你的方向测 native ROIAlign**。
 
+## 关键设计轴:每层都下采 vs 跨层保持高分辨率（必须验证）
+B-1 默认**每个 active 层都"上采→attend→下采回 native"**。隐患:上采是插值、下采是低通,**每层来回一次,高频反复被抹平、无法跨层累积**;脸在层间又回到 ~10 token,后一层拿不到前一层在高密度下长出来的细节。
+
+**改进(你的提议):上采一次后,在连续多层里都保持 P×P 高分辨率,到指定层才下采回 native。**
+- 让高频在高密度下**跨层累积/合成**(更接近 crop+1k:脸在网络里一直是高密度);
+- **上采起始层 / 下采回写层做成可配置**:`roi_up_layer`(在此层把脸 token 升到 P×P 并开始保持)、`roi_down_layer`(在此层下采回 native)。中间这段脸都是 P×P。
+
+代价/注意(比 B-1 的"层内旁路上下采"侵入性大):
+- 跨层保持会**改变主序列长度**(脸的 ~10 token 临时替换成 P×P,多脸更长)→ 要处理跨层的序列长度、位置编码、回写映射;
+- 其他 token 也会 attend 到这 P×P 脸 token(全局注意力变化),可能更好也可能更 OOD;
+- 输出仍在 `roi_down_layer` 收回 native → **脸仍是原生尺寸**,但 native token 经多层高密度精修,能编码更锐的脸。
+
 ---
 
 ## Phase 顺序（下一阶段）
@@ -39,6 +51,15 @@ ROIAlign 升采样 latent 是**插值**(带限),scatter 回 native 又是**降�
 - noise 脸 + ref 脸(+lq 脸)ROIAlign 到 **P×P**,P×P 下 attend,降采样回 native,`noise_alpha=0.6` 残差,PE 用 **PE-2**。
 - 扫 **P ∈ {16, 24, 32}**(越大对应越细、越贵、越可能 OOD)。
 - 判读:脸 crop + **ArcFace + Laplacian/清晰度**,对照 **baseline / A′ / 直接 crop-1k(上限参考)**。清晰度↑ = 方向成立。
+
+### Phase B-1.5：验证"跨层保持高分辨率 vs 每层下采"（你提的）
+- 对比两种:
+  - **V_perlayer**:每个 active 层都 上采→attend→下采(B-1 默认);
+  - **V_persist**:在 `roi_up_layer` 上采一次,连续保持 P×P 到 `roi_down_layer` 才下采。
+- 扫 `[roi_up_layer, roi_down_layer]` 跨度(短→长),`roi_down_layer` 在代码里可配。
+- 若 **V_persist 明显更锐** → per-layer 下采确实在抹高频,后续以 persist 为主;
+- 若两者接近 → per-layer 没损害,用更省的 B-1 即可。
+- 这一步直接回答"下采到底影不影响"。
 
 ### Phase B-2：PE 消融
 - PE-1 / PE-2 / PE-3 比较;姿态差大试 PE-3。
