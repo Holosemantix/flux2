@@ -28,6 +28,7 @@ docs/
   05_findings_and_verification.md  # ★ 实测发现 + 非确定性坑 + 检验纪律（必读）
   06_version_a_prime_design.md     # ★ A'(noise fix-up) 设计 + 下一版实验顺序
   07_parameter_reference.md        # ★ 所有参数含义 + Phase 1 配置逐行解释
+  08_version_b_plan.md             # ★ Version B(提分辨率/细节容量) 实验计划
 ```
 
 > `Dit_pipeline.py` 文件大、改动仅 3 行，未整份重放——补丁见 `CHANGES_version_a.md` 第 3 节。
@@ -53,6 +54,6 @@ docs/
 ## 范围 / 进展
 
 - **Version A（Expanded-KV Only）**：已实现并实测 → 小脸上无可见作用、被噪声淹没（`docs/05`）。
-- **Version A'（Noise-Fixup）**：已实现 → 直接 steer 输出 noise 段，`id_patch_fixup_noise=true` 开启。下一步主攻，实验顺序见 `docs/06`。
-- **多 ID 泄漏 mitigation**：已登记后续点。
-- **版本 B（Virtual ROI-QKV + 自适应 PE / ROIAlign 上采样小脸）**：A' 验证机制后再上；小脸大概率需要它来突破容量天花板。
+- **Version A'（Noise-Fixup）**：已实现并实测 → 输出脸**机械上响应了 ref**(结果与 baseline 有别)，但**清晰度未提升**。结论:路径有效，瓶颈在小脸的细节源/分辨率容量。
+- **Version B（提分辨率/细节容量）**：当前主攻方向。先做 `docs/08` 的 B-0 前提核查(ref 脸是否真更清晰 + 高清 ref crop 概念验证)，再上 B-reencode。
+- **多 ID 泄漏 mitigation**：已登记后续点(Version B 中每脸独立 crop 天然隔离)。
