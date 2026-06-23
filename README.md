@@ -27,6 +27,7 @@ docs/
   04_analysis_points.md            # 评价指标 + 决策树 + 后续点
   05_findings_and_verification.md  # ★ 实测发现 + 非确定性坑 + 检验纪律（必读）
   06_version_a_prime_design.md     # ★ A'(noise fix-up) 设计 + 下一版实验顺序
+  07_parameter_reference.md        # ★ 所有参数含义 + Phase 1 配置逐行解释
 ```
 
 > `Dit_pipeline.py` 文件大、改动仅 3 行，未整份重放——补丁见 `CHANGES_version_a.md` 第 3 节。
