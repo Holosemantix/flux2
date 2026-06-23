@@ -34,6 +34,26 @@
 
 ## 2. 新参数详解（重点:同一个 ratio 在 A 和 A' 里含义不同）
 
+### 2.0 关键澄清:scale 的是 query 还是 KV?和"分辨率"什么关系?
+
+**`expand_ratio_*` 只放大被 attend 的 KV(=多选一些已存在的 token);query 和写回区永远是原始人脸框;token 的密度/分辨率不变,只是空间范围变大。**
+
+| 参数 | Version A（`fixup_lqref`）| Version A'（`fixup_noise`）|
+|---|---|---|
+| `expand_ratio_ref`(r_s) | **ref 段 KV** 放大 → 被 **lq query** 看到 | **ref 段 KV(细节)** 放大 → 被 **noise query** 看到 |
+| `expand_ratio_lq`(r_t) | **lq 段 KV** 放大 → 被 **ref query** 看到 | **lq 段 KV(结构)** 放大 → 被 **noise query** 看到 |
+| **query / 写回区** | **永远原始框,从不放大** | **永远原始框(noise 人脸),从不放大** |
+
+两个要点:
+
+- ⚠️ 这里的"扩大" = **取更大的空间范围、选更多原有 token(密度不变)**,**不是把脸上采样到更高分辨率**。所以对 8~12 token 的小脸,它**没有增加细节容量** —— 这正是 Version A 对小脸近乎无效的根因之一。
+
+- 「scale up 之后再 rescale 回原大小」有两种含义,别混:
+  1. **空间范围意义**:现在就是这样 —— KV 取大范围,但 query/输出仍在原始框,**结果本来就写回原始大小**,不需要额外 rescale。
+  2. **分辨率意义(才是对小脸有用的)= Version B**:用 ROIAlign 把人脸 ROI **重采样到固定 P×P(如 32×32)更高密度** → 在高分辨率下做 attention(此时脸有足够 token 承载细节) → 再**下采样 / scatter 回原来的 8~12 token** 写回。这才是真正的"放大分辨率 → attend → 缩回原大小"。
+     - 代价:要给 P×P 这些**虚拟 token 安排位置编码**(连续坐标 PE-1 / **把扩大区压回原框坐标范围 = PE-2** / source→target 对齐 PE-3)→ 不再是零 PE 风险,属于 Version B。
+     - 你说的"scale up 再 rescale 回去",在位置编码上正对应 **PE-2(Compressed PE)**:采样范围放大,但 PE 压回原框范围,让模型仍把这些 token 当作"服务于这张脸"。
+
 ### 2.1 `expand_ratio_lq`（r_t，结构侧）
 框中心不变,宽高 × r_t,再 clip。`r_t=1.0` 即不扩。
 
