@@ -1574,10 +1574,12 @@ class Flux2Transformer2DModel(
         # ============ 限制处理的人脸数（P=64 等大开销诊断用）============
         if id_patch_config is not None and id_patch_pairs:
             _mf = getattr(id_patch_config, "roi_max_faces", -1)
-            if _mf is not None and _mf >= 0 and len(id_patch_pairs) > _mf:
-                if _ROI_DEBUG:
-                    print(f"[roi] roi_max_faces={_mf}: 用前 {_mf}/{len(id_patch_pairs)} 张脸", flush=True)
-                id_patch_pairs = id_patch_pairs[:_mf]
+            if _mf is not None:
+                _mf = _as_int(_mf)   # 防御：yaml 写成 [1]/(1,) 等
+                if _mf >= 0 and len(id_patch_pairs) > _mf:
+                    if _ROI_DEBUG:
+                        print(f"[roi] roi_max_faces={_mf}: 用前 {_mf}/{len(id_patch_pairs)} 张脸", flush=True)
+                    id_patch_pairs = id_patch_pairs[:_mf]
 
         # ============ Version B-1.5 persist：循环前在 image 尾部追加高密度脸影子 token ============
         persist_state = None
