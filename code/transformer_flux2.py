@@ -479,11 +479,21 @@ _ROI_DEBUG = bool(int(_os.environ.get("ROI_DEBUG", "0")))
 _ROI_PERSIST_WARNED = False
 
 
-def _resample_tokens_2d(x: torch.Tensor, h: int, w: int, out_h: int, out_w: int) -> torch.Tensor:
+def _as_int(v) -> int:
+    """把尺寸值强制成 python int（防御 list/tuple/np/0-d tensor，例如 roi_size 被写成 [24,24]）。"""
+    if isinstance(v, (tuple, list)):
+        v = v[0]
+    if hasattr(v, "item"):
+        v = v.item()
+    return int(v)
+
+
+def _resample_tokens_2d(x: torch.Tensor, h, w, out_h, out_w) -> torch.Tensor:
     """
     把一段 row-major 排列的 token 在 2D 上 bilinear 重采样。
     x: [B, h*w, Hh, D] → [B, out_h*out_w, Hh, D]
     """
+    h, w, out_h, out_w = _as_int(h), _as_int(w), _as_int(out_h), _as_int(out_w)
     B, n, Hh, D = x.shape
     # [B, h*w, Hh, D] -> [B, h, w, Hh*D] -> [B, Hh*D, h, w]
     x = x.reshape(B, h, w, Hh * D).permute(0, 3, 1, 2).contiguous()
@@ -573,6 +583,7 @@ def _virtual_roi_qkv_attention(
     降采样回 native noise 脸 token，noise_alpha 残差写回。用 PRE-RoPE 的 q/k/v，对虚拟 token 重配 RoPE。
     output: [B,S,Hh,D]（主全注意力结果，会被原地融合）。
     """
+    P = _as_int(P)   # 防御：roi_size 被写成 [24,24] 之类
     B, S, Hh, D = q_pre.shape
     noise_start, noise_end = ranges["noise"]
     lq_start, lq_end = ranges["lq"]
