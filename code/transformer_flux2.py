@@ -707,6 +707,14 @@ def _persist_append(hidden_img, img_ids, pos_embed, text_rope, id_patch_config,
         lq_exp = _expand_bbox(lq_bbox, exp_lq, exp_min, latent_h, latent_w)
         ref_exp = _expand_bbox(ref_bbox, exp_ref, exp_min, latent_h, latent_w)
 
+        if _ROI_DEBUG:
+            s = 16  # token->px：VAE 8x 下采 + patchify 2x = 16x
+            rh, rw = ref_exp[2] - ref_exp[0], ref_exp[3] - ref_exp[1]
+            print(f"[roi-persist] 脸: noise {h_f}x{w_f}tok(~{h_f*s}x{w_f*s}px), "
+                  f"ref源(扩) {rh}x{rw}tok(~{rh*s}x{rw*s}px); 影子 P={P}(~{P*s}px-equiv); "
+                  f"对标1k需 P≈{1024//s}, 当前 P/64={P/64:.2f}。"
+                  f"注:影子是插值放大,真细节上限=源 token 数(~{max(h_f, w_f, rh, rw)}tok)", flush=True)
+
         # noise 影子（query/写回）：exact 脸框
         noise_off = off
         appended.append(_shadow(0, lq_bbox, _ROI_T_NOISE))
