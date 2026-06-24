@@ -26,7 +26,14 @@
 | `id_patch_expand_min_size` | int | 0 | 扩大后框的最小边长(token 数),对小脸兜底;0=关 |
 | `id_patch_fixup_lqref` | bool | true | 是否保留 **Version A**(lq/ref 段 fix-up) |
 | `id_patch_fixup_noise` | bool | false | 是否开 **Version A'**(noise 段 fix-up) |
-| `id_patch_noise_alpha` | float | 0.5 | A' 的残差注入强度 α |
+| `id_patch_noise_alpha` | float | 0.5 | A'/B 的残差注入强度 α |
+| `id_patch_roi_mode` | bool | false | **Version B 总开关**(Virtual ROI-QKV) |
+| `id_patch_roi_size` | int | 24 | **P**:虚拟 ROI 边长(token),attention 时的密度 |
+| `id_patch_roi_pe_mode` | str | "pe2" | 虚拟 token 位置编码:`pe1`/`pe2`/`pe3` |
+| `id_patch_roi_include_lq` | bool | true | 虚拟 KV 是否含 lq 结构 ROI(`[lq+ref]` vs 仅 `ref`) |
+| `id_patch_roi_persist` | bool | false | 跨层保持高分辨率(**未接通**,true 仅告警回退 per-layer) |
+| `id_patch_roi_up_layer` | int | -1 | persist 起始层(预留,未接通) |
+| `id_patch_roi_down_layer` | int | -1 | persist 下采回写层(预留,未接通) |
 
 > 还有 ID 匹配相关的 `id_match_conf_threshold / id_match_dist_threshold / id_match_imgsz` 和 YOLO/ReID 路径,不在本文范围,保持你现有值即可。
 
@@ -95,6 +102,49 @@ lq 和 ref 是同一人但**表情/视角可能不同**,不能像素搬运。noi
 
 ---
 
+## 2B. Version B 参数详解（Virtual ROI-QKV）
+
+Version B 解决"小脸 token 太少、注意力粒度太粗搬不动 ref 高频"的问题:在 attention 时把人脸 ROI **升采样到 P×P 高密度** → 高密度下 attend(ref 已有的高频能细粒度迁移)→ **降采样回 native noise 脸 token** → α 残差写回。**单趟、不 crop、零后处理**。
+
+### 2B.0 它和 A/A' 的关系（先理清）
+- `roi_mode=true` 时,**noise 段的注入改由 Version B 完成**(自动关掉 native A' 的 `fixup_noise`,避免重复);
+- `fixup_lqref` 仍**独立**控制 lq/ref 段的 fix-up(可单独开关);
+- `noise_alpha`、`expand_ratio_lq/ref`、`expand_min_size`、生效层(`idx_*_window`)这些**沿用**,但在 B 里语义略有侧重(见下)。
+
+### 2B.1 `roi_mode`（总开关）
+- false:不启用,行为 = A/A'。
+- true:启用 Virtual ROI-QKV。在每个 active 层,noise 脸 query 与 ref(/lq)脸 KV 都先 ROIAlign 到 P×P 再 attend。
+
+### 2B.2 `roi_size`（P，虚拟 ROI 边长）
+- 把 native ~10 token 的脸,bilinear 重采样成 **P×P** 个 token 参与 attention。
+- P 越大 → 五官对应越细、ref 高频迁移越充分,但**计算更贵、越偏离训练分布(OOD)**。
+- 扫 **{16, 24, 32}**。
+- ⚠️ **P 是"attention 时的密度",不是输出密度**:attend 完会降采样回 native ~10 token,最终仍从 native token 解码 → **输出脸尺寸不变**,P 只决定"迁移过程"的精细度。
+
+### 2B.3 `roi_pe_mode`（虚拟 token 的位置编码）
+P×P 是新造的虚拟 token,必须重配位置 id 再 apply RoPE。三种:
+- **`pe1`**(连续真实坐标):虚拟 token 用它在原图里的真实连续坐标。几何最真实,但 ref 与 target 脸位置不同 → 相对位置仍不对齐。
+- **`pe2`**(压回原框,默认):采样范围是扩大框,但把坐标**压回原始人脸框范围**(中心不变、偏移 ÷ 扩大倍数)。直觉:"读得多,但告诉模型这些 token 仍服务这张脸"。即你说的"放大后缩回"。
+- **`pe3`**(映射到 target 脸):把 ref ROI 的归一化坐标**映射到 target(noise/lq)脸的坐标系**。ref 与 target **姿态差异大**时最该用,让对应五官位置对齐。
+- 扫 pe1/pe2/pe3(Phase B-2)。
+
+### 2B.4 `roi_include_lq`（KV 带不带 lq 结构）
+- true:虚拟 KV = `[lq 脸 ROI(结构) + ref 脸 ROI(细节)]`。lq 给 noise query 一个**结构锚**,ref 注入细节。
+- false:仅 `ref 脸 ROI` → 纯细节注入。若 lq 锚反而把结构拉糊,可试 false。
+
+### 2B.5 B 里复用参数的侧重
+- `expand_ratio_ref`(r_s):**ROIAlign 取多大 ref 区域**再重采样到 P×P(细节来源范围)。建议 2.0~2.5。
+- `expand_ratio_lq`(r_t):取多大 lq 区域(结构范围)。建议 1.0~1.5。
+- `noise_alpha`(α):降采样回 native 后的残差融合强度,同 A'。建议 0.6 起。
+- `expand_min_size`:小脸 ROI 取样的最小边长兜底。
+
+### 2B.6 `roi_persist / roi_up_layer / roi_down_layer`（跨层保持,**未接通**）
+- 目的:不在每层都"上采→下采"(反复低通抹高频),而是**上采一次、连续多层保持 P×P、到指定层才下采**,让高频跨层累积。
+- 现状:**代码里仅 scaffold**。`roi_persist=true` 只会打印一次告警并**回退 per-layer**;真正实现需改 `forward` 的序列长度与位置编码(B-1.5 后续做)。
+- `roi_up_layer`/`roi_down_layer`:预留(上采起始层 / 下采回写层),接通后生效。
+
+---
+
 ## 3. Phase 1 配置详解（A' 的 go/no-go）
 
 目的:用**最强**设置先回答"A' 到底能不能让输出脸动起来",而不是先纠结质量。
@@ -151,3 +201,16 @@ Dit:
 | P5 | — | — | — | … | … | … | 大脸验证 + 小脸转 Version B |
 
 > 改任何一组都只动表里一个变量;层/step/colorfix/seed 全锁死。
+
+### Version B（roi_mode=true）速查
+对 B 系列,额外固定 `id_patch_roi_mode: true`、`id_patch_fixup_lqref: false`(隔离),再扫:
+
+| Phase | roi_size P | roi_pe_mode | roi_include_lq | noise_alpha | r_s | 备注 |
+|---|---|---|---|---|---|---|
+| **B-1** 主 | 24 | pe2 | true | 0.6 | 2.0 | 先跑通,对照 baseline/A'/crop-1k |
+| B-1' 扫 P | **16/24/32** | pe2 | true | 0.6 | 2.0 | 越大越细越贵越 OOD |
+| B-2 PE | 最优P | **pe1/pe2/pe3** | true | 0.6 | 2.0 | 姿态差大看 pe3 |
+| B-3 强度/组成 | 最优P | 最优PE | **true/false** | **0.4/0.6/0.8** | **2.0/2.5** | — |
+| B-1.5 persist | 最优P | 最优PE | — | — | — | `roi_persist`(待接通) |
+
+> Version B 详细参数含义见上面 **§2B**;首跑务必 `ROI_DEBUG=1`。
