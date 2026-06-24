@@ -69,6 +69,15 @@ class IdPatchConfig:
     fixup_lqref: bool = True
     fixup_noise: bool = False
     noise_alpha: float = 0.5
+    # ===== Version B（Virtual ROI-QKV）=====
+    roi_mode: bool = False        # 开启 Version B：人脸 ROI 升采样到 P×P 做 attention 再降采样回写
+    roi_size: int = 24            # P，虚拟 ROI 边长（token）
+    roi_pe_mode: str = "pe2"      # 虚拟 token 位置编码：'pe1'连续/'pe2'压回原框/'pe3'映射到target脸
+    roi_include_lq: bool = True   # KV 是否包含 lq 结构 ROI（[lq + ref] vs 仅 ref）
+    # B-1.5 persist（跨层保持高分辨率）：需要 forward 改造，暂未接通，置 True 会告警并回退 per-layer
+    roi_persist: bool = False
+    roi_up_layer: int = -1
+    roi_down_layer: int = -1
 
 
 def _get_projections(attn: "Flux2Attention", hidden_states, encoder_hidden_states=None):
@@ -454,6 +463,210 @@ def _id_patch_attention(
     return output
 
 
+# ============================================================================
+# Version B：Virtual ROI-QKV（attention 内把人脸 ROI 升采样到 P×P，高密度 attend，
+# 再降采样回 native，残差注入 noise 段）。单趟、无 crop、无后处理。
+# ============================================================================
+
+# 各段的 stream/frame id（来自 KleinLatentProcessor.prepare_image_ids(scale=10)）：
+# noise=prepare_latent_ids → T=0；lq=第0个 condition → T=10；ref=第1个 → T=20。
+_ROI_T_NOISE = 0
+_ROI_T_LQ = 10
+_ROI_T_REF = 20
+
+import os as _os
+_ROI_DEBUG = bool(int(_os.environ.get("ROI_DEBUG", "0")))
+_ROI_PERSIST_WARNED = False
+
+
+def _resample_tokens_2d(x: torch.Tensor, h: int, w: int, out_h: int, out_w: int) -> torch.Tensor:
+    """
+    把一段 row-major 排列的 token 在 2D 上 bilinear 重采样。
+    x: [B, h*w, Hh, D] → [B, out_h*out_w, Hh, D]
+    """
+    B, n, Hh, D = x.shape
+    # [B, h*w, Hh, D] -> [B, h, w, Hh*D] -> [B, Hh*D, h, w]
+    x = x.reshape(B, h, w, Hh * D).permute(0, 3, 1, 2).contiguous()
+    orig_dtype = x.dtype
+    x = F.interpolate(x.float(), size=(out_h, out_w), mode="bilinear", align_corners=False).to(orig_dtype)
+    # [B, Hh*D, out_h, out_w] -> [B, out_h*out_w, Hh, D]
+    x = x.permute(0, 2, 3, 1).contiguous().reshape(B, out_h * out_w, Hh, D)
+    return x
+
+
+def _make_roi_pos_ids(
+    sample_box: Tuple[int, int, int, int],
+    orig_box: Tuple[int, int, int, int],
+    P: int,
+    t_val: int,
+    mode: str,
+    target_box: Optional[Tuple[int, int, int, int]] = None,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    为 P×P 虚拟 token 生成 4D 位置 id (T, H, W, L)。
+    - sample_box: 实际采样所用的（扩大后）框，决定连续真实坐标范围。
+    - orig_box:   原始人脸框（PE-2 压缩的参照中心/范围）。
+    - mode: 'pe1' 连续真实坐标 / 'pe2' 压回原框范围 / 'pe3' 映射到 target_box 坐标系。
+    返回 [P*P, 4]（float）。
+    """
+    y1, x1, y2, x2 = sample_box
+    ys = torch.linspace(float(y1), float(y2), P, device=device)
+    xs = torch.linspace(float(x1), float(x2), P, device=device)
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+    gy = gy.reshape(-1)
+    gx = gx.reshape(-1)
+
+    if mode == "pe2":
+        oy1, ox1, oy2, ox2 = orig_box
+        cy = (oy1 + oy2) / 2.0
+        cx = (ox1 + ox2) / 2.0
+        ry = max(y2 - y1, 1e-6) / max(oy2 - oy1, 1e-6)   # = 扩大倍数
+        rx = max(x2 - x1, 1e-6) / max(ox2 - ox1, 1e-6)
+        gy = cy + (gy - cy) / ry
+        gx = cx + (gx - cx) / rx
+    elif mode == "pe3" and target_box is not None:
+        ty1, tx1, ty2, tx2 = target_box
+        ny = (gy - y1) / max(y2 - y1, 1e-6)
+        nx = (gx - x1) / max(x2 - x1, 1e-6)
+        gy = ty1 + ny * (ty2 - ty1)
+        gx = tx1 + nx * (tx2 - tx1)
+    # 'pe1': 保持 sample_box 连续真实坐标
+
+    t = torch.full_like(gy, float(t_val))
+    l = torch.zeros_like(gy)
+    return torch.stack([t, gy, gx, l], dim=-1)   # [P*P, 4]
+
+
+def _virtual_rope_freqs(ids: torch.Tensor, theta: int, axes_dim) -> Tuple[torch.Tensor, torch.Tensor]:
+    """复刻 Flux2PosEmbed.forward，为虚拟 token 算 (cos, sin)，各 [N, sum(axes_dim)]。"""
+    is_npu = ids.device.type == "npu"
+    is_mps = ids.device.type == "mps"
+    freqs_dtype = torch.float32 if (is_npu or is_mps) else torch.float64
+    pos = ids.float()
+    cos_out, sin_out = [], []
+    for i in range(len(axes_dim)):
+        c, s = get_1d_rotary_pos_embed(
+            axes_dim[i], pos[..., i], theta=theta,
+            repeat_interleave_real=True, use_real=True, freqs_dtype=freqs_dtype,
+        )
+        cos_out.append(c)
+        sin_out.append(s)
+    cos = torch.cat(cos_out, dim=-1).to(ids.device)
+    sin = torch.cat(sin_out, dim=-1).to(ids.device)
+    return cos, sin
+
+
+def _virtual_roi_qkv_attention(
+    output: torch.Tensor,
+    q_pre: torch.Tensor, k_pre: torch.Tensor, v_pre: torch.Tensor,
+    ranges: Dict[str, Tuple[int, int]],
+    id_patch_pairs: List[Dict[str, Tuple[int, int, int, int]]],
+    latent_h: int, latent_w: int,
+    P: int, pe_mode: str, include_lq: bool, noise_alpha: float,
+    exp_lq: float, exp_ref: float, exp_min: int,
+    rope_theta: int, axes_dim,
+    backend=None, parallel_config=None,
+) -> torch.Tensor:
+    """
+    Version B 主体：noise 脸 query 与 ref(/lq) KV 都 ROIAlign 到 P×P，高密度 attend，
+    降采样回 native noise 脸 token，noise_alpha 残差写回。用 PRE-RoPE 的 q/k/v，对虚拟 token 重配 RoPE。
+    output: [B,S,Hh,D]（主全注意力结果，会被原地融合）。
+    """
+    B, S, Hh, D = q_pre.shape
+    noise_start, noise_end = ranges["noise"]
+    lq_start, lq_end = ranges["lq"]
+    ref_start, ref_end = ranges["ref"]
+    if not id_patch_pairs or noise_end <= noise_start or ref_end <= ref_start:
+        return output
+    dev = q_pre.device
+
+    for pair in id_patch_pairs:
+        lq_bbox = pair["lq"]
+        ref_bbox = pair["ref"]
+        ly1, lx1, ly2, lx2 = lq_bbox
+        h_f, w_f = ly2 - ly1, lx2 - lx1
+        if h_f <= 0 or w_f <= 0:
+            continue
+
+        ref_exp = _expand_bbox(ref_bbox, exp_ref, exp_min, latent_h, latent_w)
+        lq_exp = _expand_bbox(lq_bbox, exp_lq, exp_min, latent_h, latent_w)
+
+        # ---- 虚拟 query：noise 脸(原始框) 升到 P×P ----
+        nq_idx = _build_2d_rect_indices(ly1, lx1, ly2, lx2, latent_w, dev) + noise_start
+        virt_q = _resample_tokens_2d(q_pre[:, nq_idx], h_f, w_f, P, P)               # [B,P²,Hh,D]
+        q_ids = _make_roi_pos_ids(lq_bbox, lq_bbox, P, _ROI_T_NOISE, "pe1", device=dev)
+        qc, qs = _virtual_rope_freqs(q_ids, rope_theta, axes_dim)
+        virt_q = apply_rotary_emb(virt_q, (qc, qs), sequence_dim=1)
+
+        # ---- 虚拟 ref KV（细节）：扩大 ref 区域 升到 P×P ----
+        ry1, rx1, ry2, rx2 = ref_exp
+        rk_idx = _build_2d_rect_indices(ry1, rx1, ry2, rx2, latent_w, dev) + ref_start
+        virt_k_ref = _resample_tokens_2d(k_pre[:, rk_idx], ry2 - ry1, rx2 - rx1, P, P)
+        virt_v_ref = _resample_tokens_2d(v_pre[:, rk_idx], ry2 - ry1, rx2 - rx1, P, P)
+        ref_ids = _make_roi_pos_ids(ref_exp, ref_bbox, P, _ROI_T_REF, pe_mode, target_box=lq_bbox, device=dev)
+        rc, rs = _virtual_rope_freqs(ref_ids, rope_theta, axes_dim)
+        virt_k_ref = apply_rotary_emb(virt_k_ref, (rc, rs), sequence_dim=1)
+
+        ks, vs = [virt_k_ref], [virt_v_ref]
+
+        # ---- 可选 虚拟 lq KV（结构）：扩大 lq 区域 升到 P×P ----
+        if include_lq and lq_end > lq_start:
+            ey1, ex1, ey2, ex2 = lq_exp
+            lk_idx = _build_2d_rect_indices(ey1, ex1, ey2, ex2, latent_w, dev) + lq_start
+            virt_k_lq = _resample_tokens_2d(k_pre[:, lk_idx], ey2 - ey1, ex2 - ex1, P, P)
+            virt_v_lq = _resample_tokens_2d(v_pre[:, lk_idx], ey2 - ey1, ex2 - ex1, P, P)
+            lq_ids = _make_roi_pos_ids(lq_exp, lq_bbox, P, _ROI_T_LQ, pe_mode, target_box=lq_bbox, device=dev)
+            lc, ls = _virtual_rope_freqs(lq_ids, rope_theta, axes_dim)
+            virt_k_lq = apply_rotary_emb(virt_k_lq, (lc, ls), sequence_dim=1)
+            ks = [virt_k_lq, virt_k_ref]
+            vs = [virt_v_lq, virt_v_ref]
+
+        virt_k = torch.cat(ks, dim=1)
+        virt_v = torch.cat(vs, dim=1)
+
+        if _ROI_DEBUG:
+            print(f"[roi] P={P} pe={pe_mode} noise_face={h_f}x{w_f} "
+                  f"virt_q={tuple(virt_q.shape)} virt_k={tuple(virt_k.shape)}", flush=True)
+
+        virt_out = _dispatch_attention(virt_q, virt_k, virt_v, num_heads=Hh,
+                                       backend=backend, parallel_config=parallel_config)  # [B,P²,Hh,D]
+        out_native = _resample_tokens_2d(virt_out, P, P, h_f, w_f)                          # [B,h_f*w_f,Hh,D]
+        output[:, nq_idx] = (1.0 - noise_alpha) * output[:, nq_idx] + noise_alpha * out_native
+
+    return output
+
+
+def _maybe_virtual_roi(
+    output, q_pre, k_pre, v_pre, ranges, id_patch_pairs, latent_h, latent_w,
+    id_patch_config, rope_theta, rope_axes_dim, backend, parallel_config,
+):
+    """从 id_patch_config 取 Version B 参数并调用 _virtual_roi_qkv_attention。
+    persist 暂未接通（需 forward 改造），置 True 时告警并回退 per-layer。"""
+    if rope_theta is None or rope_axes_dim is None:
+        logger.warning("roi_mode 需要 rope_theta/rope_axes_dim，但未传入，跳过 Version B。")
+        return output
+    if getattr(id_patch_config, "roi_persist", False):
+        global _ROI_PERSIST_WARNED
+        if not _ROI_PERSIST_WARNED:
+            logger.warning(
+                "roi_persist=True 尚未接通（需改 forward 的序列长度/位置编码），本次回退 per-layer。"
+            )
+            _ROI_PERSIST_WARNED = True
+    return _virtual_roi_qkv_attention(
+        output, q_pre, k_pre, v_pre, ranges, id_patch_pairs, latent_h, latent_w,
+        P=getattr(id_patch_config, "roi_size", 24),
+        pe_mode=getattr(id_patch_config, "roi_pe_mode", "pe2"),
+        include_lq=getattr(id_patch_config, "roi_include_lq", True),
+        noise_alpha=getattr(id_patch_config, "noise_alpha", 0.5),
+        exp_lq=getattr(id_patch_config, "expand_ratio_lq", 1.0),
+        exp_ref=getattr(id_patch_config, "expand_ratio_ref", 1.0),
+        exp_min=getattr(id_patch_config, "expand_min_size", 0),
+        rope_theta=rope_theta, axes_dim=rope_axes_dim,
+        backend=backend, parallel_config=parallel_config,
+    )
+
+
 # ============ Processor 类 ============
 class Flux2SwiGLU(nn.Module):
     def __init__(self):
@@ -513,6 +726,8 @@ class Flux2AttnProcessor:
         id_patch_pairs: Optional[List[Dict[str, Tuple[int, int, int, int]]]] = None,
         latent_h: Optional[int] = None,
         latent_w: Optional[int] = None,
+        rope_theta: Optional[int] = None,
+        rope_axes_dim: Optional[Tuple[int, ...]] = None,
     ) -> torch.Tensor:
         query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
             attn, hidden_states, encoder_hidden_states
@@ -536,6 +751,9 @@ class Flux2AttnProcessor:
             query = torch.cat([encoder_query, query], dim=1)
             key = torch.cat([encoder_key, key], dim=1)
             value = torch.cat([encoder_value, value], dim=1)
+
+        # 保存 PRE-RoPE 的 q/k/v（Version B 用：对虚拟 token 重配 RoPE）
+        q_pre, k_pre, v_pre = query, key, value
 
         if image_rotary_emb is not None:
             query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
@@ -565,6 +783,7 @@ class Flux2AttnProcessor:
             sn, sl, sr = attn_segments
             st = txt_len
             ranges = _compute_segment_ranges(st, sn, sl, sr, img_first=False)
+            roi_mode = getattr(id_patch_config, "roi_mode", False)
 
             hidden_states = _id_patch_attention(
                 query, key, value,
@@ -576,11 +795,19 @@ class Flux2AttnProcessor:
                 expand_ratio_ref=getattr(id_patch_config, "expand_ratio_ref", 1.0),
                 expand_min_size=getattr(id_patch_config, "expand_min_size", 0),
                 fixup_lqref=getattr(id_patch_config, "fixup_lqref", True),
-                fixup_noise=getattr(id_patch_config, "fixup_noise", False),
+                # roi_mode 时 noise 注入交给 Version B，避免重复
+                fixup_noise=getattr(id_patch_config, "fixup_noise", False) and not roi_mode,
                 noise_alpha=getattr(id_patch_config, "noise_alpha", 0.5),
                 backend=self._attention_backend,
                 parallel_config=self._parallel_config,
             )
+
+            if roi_mode:
+                hidden_states = _maybe_virtual_roi(
+                    hidden_states, q_pre, k_pre, v_pre, ranges, id_patch_pairs,
+                    latent_h, latent_w, id_patch_config, rope_theta, rope_axes_dim,
+                    self._attention_backend, self._parallel_config,
+                )
         else:
             hidden_states = dispatch_attention_fn(
                 query, key, value,
@@ -705,6 +932,8 @@ class Flux2ParallelSelfAttnProcessor:
         id_patch_pairs: Optional[List[Dict[str, Tuple[int, int, int, int]]]] = None,
         latent_h: Optional[int] = None,
         latent_w: Optional[int] = None,
+        rope_theta: Optional[int] = None,
+        rope_axes_dim: Optional[Tuple[int, ...]] = None,
     ) -> torch.Tensor:
         hidden_states_proj = attn.to_qkv_mlp_proj(hidden_states)
         qkv, mlp_hidden_states = torch.split(
@@ -719,6 +948,9 @@ class Flux2ParallelSelfAttnProcessor:
 
         query = attn.norm_q(query)
         key = attn.norm_k(key)
+
+        # 保存 PRE-RoPE 的 q/k/v（Version B 用）
+        q_pre, k_pre, v_pre = query, key, value
 
         if image_rotary_emb is not None:
             query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
@@ -744,6 +976,7 @@ class Flux2ParallelSelfAttnProcessor:
             sn, sl, sr = attn_segments
             st = txt_len
             ranges = _compute_segment_ranges(st, sn, sl, sr, img_first=False)
+            roi_mode = getattr(id_patch_config, "roi_mode", False)
 
             attn_output = _id_patch_attention(
                 query, key, value,
@@ -755,11 +988,18 @@ class Flux2ParallelSelfAttnProcessor:
                 expand_ratio_ref=getattr(id_patch_config, "expand_ratio_ref", 1.0),
                 expand_min_size=getattr(id_patch_config, "expand_min_size", 0),
                 fixup_lqref=getattr(id_patch_config, "fixup_lqref", True),
-                fixup_noise=getattr(id_patch_config, "fixup_noise", False),
+                fixup_noise=getattr(id_patch_config, "fixup_noise", False) and not roi_mode,
                 noise_alpha=getattr(id_patch_config, "noise_alpha", 0.5),
                 backend=self._attention_backend,
                 parallel_config=self._parallel_config,
             )
+
+            if roi_mode:
+                attn_output = _maybe_virtual_roi(
+                    attn_output, q_pre, k_pre, v_pre, ranges, id_patch_pairs,
+                    latent_h, latent_w, id_patch_config, rope_theta, rope_axes_dim,
+                    self._attention_backend, self._parallel_config,
+                )
         else:
             attn_output = dispatch_attention_fn(
                 query, key, value,
@@ -1249,6 +1489,9 @@ class Flux2Transformer2DModel(
                 "txt_len": num_txt_tokens,
                 "latent_h": latent_h,
                 "latent_w": latent_w,
+                # Version B 虚拟 token 重配 RoPE 所需
+                "rope_theta": self.pos_embed.theta,
+                "rope_axes_dim": self.pos_embed.axes_dim,
             }
 
         # Double Stream Transformer Blocks

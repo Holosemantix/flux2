@@ -62,6 +62,14 @@ class IdPatchConfig:
     fixup_lqref: bool = True
     fixup_noise: bool = False
     noise_alpha: float = 0.5
+    # ===== Version B（Virtual ROI-QKV）=====
+    roi_mode: bool = False
+    roi_size: int = 24
+    roi_pe_mode: str = "pe2"
+    roi_include_lq: bool = True
+    roi_persist: bool = False        # 暂未接通（需 forward 改造），置 True 告警并回退 per-layer
+    roi_up_layer: int = -1
+    roi_down_layer: int = -1
 
 
 class RefinerModel(object):
@@ -144,6 +152,14 @@ class RefinerModel(object):
                 fixup_lqref=kwargs.get('id_patch_fixup_lqref', True),
                 fixup_noise=kwargs.get('id_patch_fixup_noise', False),
                 noise_alpha=kwargs.get('id_patch_noise_alpha', 0.5),
+                # ===== Version B (Virtual ROI-QKV) 旋钮 =====
+                roi_mode=kwargs.get('id_patch_roi_mode', False),
+                roi_size=kwargs.get('id_patch_roi_size', 24),
+                roi_pe_mode=kwargs.get('id_patch_roi_pe_mode', 'pe2'),
+                roi_include_lq=kwargs.get('id_patch_roi_include_lq', True),
+                roi_persist=kwargs.get('id_patch_roi_persist', False),
+                roi_up_layer=kwargs.get('id_patch_roi_up_layer', -1),
+                roi_down_layer=kwargs.get('id_patch_roi_down_layer', -1),
             )
             if self.rank == 0:
                 print(f"\n---ID Patch Attention enabled with config: {self.id_patch_config}")

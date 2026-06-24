@@ -235,3 +235,36 @@ dit_params['id_patch_noise_alpha'] = self.cfg.get('id_patch_noise_alpha', 0.5)
 ```
 
 `code/transformer_flux2.py` 和 `code/refine_model.py` 已是含 A' 的整份文件。
+
+---
+
+# Version B 改动清单（Virtual ROI-QKV）
+
+> 单趟、attention 内把人脸 ROI 升采样到 P×P 做高密度 attention、降采样回 native noise 脸、残差注入。
+> 默认 `roi_mode=False` 时行为不变。设计见 `docs/08`，参数见 `docs/08` 末。
+
+## B-1. `transformer_flux2.py`
+- **`IdPatchConfig`** 加字段:`roi_mode/roi_size/roi_pe_mode/roi_include_lq/roi_persist/roi_up_layer/roi_down_layer`。
+- 新增 helper:`_resample_tokens_2d`(2D bilinear 重采样 token)、`_make_roi_pos_ids`(虚拟 token 4D 位置 id,支持 pe1/pe2/pe3)、`_virtual_rope_freqs`(复刻 Flux2PosEmbed 给虚拟 token 算 cos/sin)、`_virtual_roi_qkv_attention`(主体)、`_maybe_virtual_roi`(取配置+persist 告警)。
+- **两个 processor**:在 `apply_rotary_emb` 前保存 `q_pre,k_pre,v_pre`(PRE-RoPE);在 `use_id_patch` 分支里,`roi_mode` 时把 `_id_patch_attention` 的 `fixup_noise` 关掉(交给 Version B),并在其后调用 `_maybe_virtual_roi(...)`;`__call__` 签名加 `rope_theta/rope_axes_dim`。
+- **`forward`**:`id_patch_attention_kwargs` 加 `"rope_theta": self.pos_embed.theta, "rope_axes_dim": self.pos_embed.axes_dim`。
+- stream id 常量:`_ROI_T_NOISE=0 / _ROI_T_LQ=10 / _ROI_T_REF=20`(来自 `prepare_image_ids(scale=10)`)。
+- `ROI_DEBUG=1` 打印虚拟 token 形状,首跑务必开。
+
+## B-2. `refine_model.py`
+- `IdPatchConfig` 同步加 7 个 roi 字段;`__init__` 构造时透传 `id_patch_roi_*`。
+
+## B-3. `Dit_pipeline.py`（`load_modules` 再加 7 行透传）
+```python
+dit_params['id_patch_roi_mode']       = self.cfg.get('id_patch_roi_mode', False)
+dit_params['id_patch_roi_size']       = self.cfg.get('id_patch_roi_size', 24)
+dit_params['id_patch_roi_pe_mode']    = self.cfg.get('id_patch_roi_pe_mode', 'pe2')
+dit_params['id_patch_roi_include_lq'] = self.cfg.get('id_patch_roi_include_lq', True)
+dit_params['id_patch_roi_persist']    = self.cfg.get('id_patch_roi_persist', False)
+dit_params['id_patch_roi_up_layer']   = self.cfg.get('id_patch_roi_up_layer', -1)
+dit_params['id_patch_roi_down_layer'] = self.cfg.get('id_patch_roi_down_layer', -1)
+```
+
+## 注意
+- **persist(B-1.5)未接通**:`roi_persist=True` 仅告警并回退 per-layer(真正跨层保持需改 `forward` 的序列长度+位置编码,后续单独做)。
+- 本机无 torch,代码仅过 `py_compile`;**NPU 首跑请 `ROI_DEBUG=1`** 核对虚拟 token 形状与 PE。

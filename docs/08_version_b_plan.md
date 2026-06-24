@@ -81,4 +81,55 @@ B-1 默认**每个 active 层都"上采→attend→下采回 native"**。隐患:
 - attend 后 inverse-ROIAlign(bilinear)回 native 脸 token 数,`(1-α)·全注意力 + α·此结果` 写回 noise 脸。
 - 全程单趟,输出零后处理。
 
-> 这条完全贴合"在 attention 里扩大 ROI、不要后处理"。你定一下 **P(先 24?)和 PE(先 PE-2?)**,我来写 Virtual ROI-QKV 的完整实现(ROIAlign + 虚拟 token PE + 降采样回写,复用 A′ 的残差融合)。
+---
+
+## ✅ 已实现（code/transformer_flux2.py + refine_model.py），下面是 B 系列实验参数
+
+代码已落地(per-layer Virtual ROI-QKV)。`roi_mode=False` 时行为不变。合入需补 `Dit_pipeline` 的 7 行透传(见 `../CHANGES_version_a.md` 的 Version B 第 B-3 节)。
+
+### cfg key（yaml `Dit:` 下）
+
+| key | 默认 | 含义 |
+|---|---|---|
+| `id_patch_roi_mode` | false | **Version B 总开关**(开了就用虚拟 ROI 注入 noise,替代 native A′) |
+| `id_patch_roi_size` | 24 | **P**,虚拟 ROI 边长(token);扫 {16,24,32} |
+| `id_patch_roi_pe_mode` | "pe2" | 虚拟 token PE:`pe1`连续 / `pe2`压回原框 / `pe3`映射到 target 脸 |
+| `id_patch_roi_include_lq` | true | KV 是否含 lq 结构 ROI(`[lq+ref]` vs 仅 `ref`) |
+| `id_patch_noise_alpha` | 0.5 | 残差注入强度(沿用 A′ 的) |
+| `id_patch_expand_ratio_ref` | 1.0→2.0 | ROIAlign 取多大 ref 区域(细节范围) |
+| `id_patch_expand_ratio_lq` | 1.0→1.5 | ROIAlign 取多大 lq 区域(结构范围) |
+| `id_patch_idx_double_window` / `_single_window` | — | 在哪些层做(沿用,double 仅 0~7) |
+| `id_patch_roi_persist` | false | 跨层保持(**未接通**,置 true 仅告警回退 per-layer) |
+| `id_patch_roi_up_layer` / `_down_layer` | -1 | persist 用(预留) |
+
+### Phase B-1（主实验）cfg
+```yaml
+Dit:
+  use_id_patch_attention: true
+  patch_split_num: 1
+  id_patch_idx_double_window: [1, 3, 5, 7]
+  id_patch_idx_single_window: [1, 3]
+  id_patch_fixup_lqref: false        # 隔离，单测 Version B 的 noise 注入
+  id_patch_roi_mode: true            # 开 Version B
+  id_patch_roi_size: 24              # P=24
+  id_patch_roi_pe_mode: "pe2"
+  id_patch_roi_include_lq: true
+  id_patch_noise_alpha: 0.6
+  id_patch_expand_ratio_ref: 2.0     # ROI 取 2× 脸框
+  id_patch_expand_ratio_lq: 1.5
+  id_patch_expand_min_size: 0
+```
+
+### 各 Phase 扫的参数
+| Phase | 变量 | 取值 |
+|---|---|---|
+| B-1 | `roi_size` P | {16, 24, 32} |
+| B-2 | `roi_pe_mode` | pe1 / pe2 / pe3 |
+| B-3 | `noise_alpha` / `roi_include_lq` / `expand_ratio_ref` | α∈{0.4,0.6,0.8} / {true,false} / r_s∈{2.0,2.5} |
+| B-4 | 生效层 / 多 ID | 加/减层;多脸自动批 |
+| B-1.5 | `roi_persist`(待接通) | up/down layer 跨度 |
+
+### 首跑务必
+- `ROI_DEBUG=1` 看 `[roi]` 行的 `virt_q/virt_k` 形状是否 `[B, P², Hh, D]`、noise_face 尺寸是否合理。
+- 先测噪声底(同配置跑两遍),再对照 baseline / A′ / **crop-1k(上限)** 用脸 crop + ArcFace/Laplacian 判定清晰度。
+- 本机无 torch,代码仅过 py_compile;NPU 上若 `F.interpolate(bf16)` 或 `apply_rotary_emb` 广播报错,看 `ROI_DEBUG` 定位后告诉我。
