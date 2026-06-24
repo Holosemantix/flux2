@@ -47,7 +47,181 @@ native noise face q_i
 
 ---
 
-## 3. 已推送的代码入口
+## 3. 数学形式化
+
+### 3.1 原始 ROI noise token
+
+设某个 ID 的 noise 人脸 ROI 在 native token 网格中有 `N_f` 个 token。第 `i` 个 native noise face token 的 query 记为：
+
+```math
+q_i \in \mathbb{R}^{H \times d}, \quad i=1,\dots,N_f
+```
+
+其中 `H` 是 attention head 数，`d` 是每个 head 的维度。普通 A′ 直接用这个 `q_i` attend 到局部 lq/ref K/V：
+
+```math
+z_i = \operatorname{Attn}(q_i, K_{lq}\oplus K_{ref}, V_{lq}\oplus V_{ref})
+```
+
+问题是：当小脸只有 `8–12` 个 native token 时，每个 `q_i` 的空间采样很粗，`q_i` 和 ref face token 的匹配粒度不足。
+
+### 3.2 子查询：只复制 query 内容，不插值 value
+
+令 `m = id_patch_roi_subsample`。对每个 native query `q_i`，生成 `m^2` 个 sub-query：
+
+```math
+\tilde{q}_{i,a,b}^{raw} = q_i, \quad a,b \in \{0,\dots,m-1\}
+```
+
+注意这里 **内容向量完全相同**，不是 bilinear interpolation。唯一变化是子 token 位置。
+
+如果 native token 的网格坐标是 `(y_i, x_i)`，则第 `(a,b)` 个子查询的位置设为：
+
+```math
+\tilde{p}_{i,a,b}
+=
+\left(
+T_{noise},\
+y_i + \frac{a+0.5}{m} - 0.5,\
+x_i + \frac{b+0.5}{m} - 0.5,\
+0
+\right)
+```
+
+然后对 sub-query 重新施加 RoPE：
+
+```math
+\tilde{q}_{i,a,b} = \operatorname{RoPE}(\tilde{q}_{i,a,b}^{raw}, \tilde{p}_{i,a,b})
+```
+
+直观解释：每个 native token 内部放 `m×m` 个“探针”，探针不是新 latent，也不是新像素，只是在 attention logits 里用更细的相位位置去询问 ref/lq。
+
+### 3.3 native lq/ref K/V，不做 P×P 插值
+
+lq 结构分支的 key/value 直接取 native lq ROI：
+
+```math
+K_l, V_l = K/V(\operatorname{ROI}_{lq}^{exp})
+```
+
+ref 细节分支的 key/value 直接取 native ref ROI：
+
+```math
+K_r, V_r = K/V(\operatorname{ROI}_{ref}^{exp})
+```
+
+其中 `exp` 表示外扩 bbox，例如 `expand_ratio_lq=1.5`、`expand_ratio_ref=2.0`。这些 K/V 是原始模型已经投影出的 native K/V，不做 ROIAlign 上采样，不做 latent value 插值。
+
+对 ref 的位置可以用 `pe3` 映射到 target/lq 脸坐标系。若 ref bbox 坐标是 `(y_r,x_r)`，映射到 target bbox 的位置记作：
+
+```math
+p_{r \rightarrow t}
+= \Phi_{r\rightarrow t}(p_r)
+```
+
+因此：
+
+```math
+K_r^{rope} = \operatorname{RoPE}(K_r, \Phi_{r\rightarrow t}(p_r))
+```
+
+### 3.4 split-branch attention：避免 lq/ref 互相稀释
+
+如果把 lq 和 ref 直接 concat 到一个 softmax：
+
+```math
+\operatorname{Attn}(\tilde{q}, K_l \oplus K_r, V_l \oplus V_r)
+```
+
+ref 细节很容易被 lq 结构 token 稀释。B-2 默认用 split branch：
+
+```math
+s_{i,a,b}^{lq}
+= \operatorname{Attn}(\tilde{q}_{i,a,b}, K_l, V_l)
+```
+
+```math
+s_{i,a,b}^{ref}
+= \operatorname{Attn}(\tilde{q}_{i,a,b}, K_r, V_r)
+```
+
+再用 `detail_beta = \beta` 融合：
+
+```math
+s_{i,a,b}
+= (1-\beta)\,s_{i,a,b}^{lq} + \beta\,s_{i,a,b}^{ref}
+```
+
+直观解释：lq 分支负责结构、姿态和表情稳定；ref 分支负责身份和细节。分开 softmax 后，ref 分支不会在同一个归一化分母里被 lq token 吃掉权重。
+
+### 3.5 聚合回 native token
+
+对同一个 native token 的 `m^2` 个 sub-query 输出做聚合：
+
+```math
+\bar{s}_i
+= \operatorname{Agg}_{a,b}(s_{i,a,b})
+```
+
+当前实现先用 mean：
+
+```math
+\bar{s}_i = \frac{1}{m^2}\sum_{a=0}^{m-1}\sum_{b=0}^{m-1}s_{i,a,b}
+```
+
+也预留了 `center` 聚合，即只取中心 sub-query。
+
+最后残差写回原 native noise face token：
+
+```math
+o_i^{new}
+= (1-\alpha)o_i^{base} + \alpha\bar{s}_i
+```
+
+其中：
+
+- `o_i^{base}` 是原始 full attention 的输出；
+- `\alpha = id_patch_noise_alpha`；
+- 写回位置仍是原始 native face ROI，不新增 token、不改输出网格。
+
+### 3.6 和旧 B 的数学区别
+
+旧 B 是内容上采样：
+
+```math
+Q^{P\times P}, K^{P\times P}, V^{P\times P}
+= \operatorname{Interp}(Q,K,V)
+```
+
+然后：
+
+```math
+O^{P\times P}=\operatorname{Attn}(Q^{P\times P},K^{P\times P},V^{P\times P})
+```
+
+最后：
+
+```math
+O^{native}=\operatorname{Downsample}(O^{P\times P})
+```
+
+这条路径有两次低通风险：`Interp` 和 `Downsample`。
+
+B-2 是 query 探针上采样：
+
+```math
+\tilde{Q}=\operatorname{Repeat}(Q) + \operatorname{SubtokenRoPE}
+```
+
+```math
+\bar{O}^{native}=\operatorname{Agg}(\operatorname{Attn}(\tilde{Q},K^{native},V^{native}))
+```
+
+没有 `Interp(V)`，也没有 `Downsample(O)`，因此不会因为 value 插值和 latent 下采样天然变糊。
+
+---
+
+## 4. 已推送的代码入口
 
 新增 patch helper：
 
@@ -82,7 +256,7 @@ id_patch_roi_detail_beta: 0.5           # split 下 ref 分支权重；扫 {0.3,
 
 ---
 
-## 4. 推荐实验配置
+## 5. 推荐实验配置
 
 先用单脸、少层、debug 模式确认机制：
 
@@ -137,7 +311,7 @@ ROI_DEBUG=1 <your-run-command>
 
 ---
 
-## 5. 实验矩阵
+## 6. 实验矩阵
 
 严格沿用 `docs/05` 的检验纪律：先跑 baseline×2 测噪声底，再看脸 crop，不要只看整图 pixel diff。
 
@@ -160,7 +334,7 @@ ROI_DEBUG=1 <your-run-command>
 
 ---
 
-## 6. 预期结果与决策
+## 7. 预期结果与决策
 
 ### 若 Q-only supersampling 有轻微但稳定提升
 说明“attention 匹配分辨率”确实是一个独立旋钮，可以继续发展成：
@@ -183,9 +357,32 @@ ROI_DEBUG=1 <your-run-command>
 
 ---
 
-## 7. 创新性分析
+## 8. 和 RALU 一样吗？
 
-### 7.1 和已有 region-adaptive / foveated 方法的区别
+**不一样。** 二者都属于“区域自适应 / ROI 优先”的思路，但操作层级不同。
+
+| 维度 | RALU | B-2 Q-only supersampling |
+|---|---|---|
+| 目标 | 加速 DiT 推理，同时保留画质 | 验证小脸 ID 细节迁移是否受 attention 匹配粒度限制 |
+| 分辨率操作 | 改变 latent 采样分辨率：低分全局 → ROI full-res → 全量 full-res refinement | 不改变 latent 分辨率、不新增输出 token |
+| 是否改变 denoising trajectory | 是，多阶段 mixed-resolution denoising | 否，只改选定 attention 层的 ROI query path |
+| 是否需要噪声/时间步重调度 | RALU 需要 noise-timestep rescheduling 稳定分辨率切换 | 当前 B-2 不需要，因为没有 latent 分辨率切换 |
+| 是否插值/上采 latent | 是，属于 latent sampling / upsampling 范畴 | 否，K/V/V-output 都保持 native；只增加 sub-query probes |
+| 核心机制 | spatial mixed-resolution latent sampling | query-foveated attention / sub-token RoPE probing |
+
+可以把二者的共同点概括为：
+
+```text
+都认为：全图同等分辨率/同等计算不是最优，重要 ROI 应该获得更多计算。
+```
+
+但不能说它们是同一个方法。RALU 是 **latent-resolution scheduling**；B-2 是 **attention-query supersampling**。
+
+---
+
+## 9. 创新性分析
+
+### 9.1 和已有 region-adaptive / foveated 方法的区别
 
 已有方法大多在 **token 数/分辨率本身** 上做 mixed-resolution：
 
@@ -195,13 +392,13 @@ ROI_DEBUG=1 <your-run-command>
 
 本方案不同：它不改变最终 token 网格，不做输出后处理，也不把 ROI 作为新高分图 crop 后单独跑；它只在 attention 内部增加 **query probe density**，用子查询的 RoPE 相位变化来提高匹配细粒度。这更接近“attention 内 foveation”，而不是“latent/image resolution foveation”。
 
-### 7.2 和 CRPA / mixed-resolution RoPE 的关系
+### 9.2 和 CRPA / mixed-resolution RoPE 的关系
 
 CRPA 指出 mixed-resolution DiT 的关键问题是 RoPE phase aliasing：不同分辨率网格混在一个 attention 里时，线性坐标插值会让同一物理距离对应不同相位增量，造成 blur/artifact。
 
 Q-only supersampling 避免了旧 B 最危险的部分：不插值 V、不产生 P×P latent、不再下采样 latent output。它只让 Q 以子 token 位置去探测 native K/V；这为后续实现 CRPA-style query-stride RoPE 留出了清晰接口。
 
-### 7.3 对图像编辑 / 合影超分的潜在贡献点
+### 9.3 对图像编辑 / 合影超分的潜在贡献点
 
 如果实验成立，创新点可以概括为：
 
@@ -216,7 +413,7 @@ Q-only supersampling 避免了旧 B 最危险的部分：不插值 V、不产生
 
 ---
 
-## 8. 本次 patch 的边界
+## 10. 本次 patch 的边界
 
 - patch helper 已推送，但我没有在 NPU 环境实际运行；必须先 `py_compile` + `ROI_DEBUG=1` 首跑。
 - B-2 是下一步验证代码，不保证一定提升清晰度；它的价值是避免已证伪的插值低通路径。
