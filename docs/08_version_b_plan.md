@@ -127,9 +127,39 @@ Dit:
 | B-2 | `roi_pe_mode` | pe1 / pe2 / pe3 |
 | B-3 | `noise_alpha` / `roi_include_lq` / `expand_ratio_ref` | α∈{0.4,0.6,0.8} / {true,false} / r_s∈{2.0,2.5} |
 | B-4 | 生效层 / 多 ID | 加/减层;多脸自动批 |
-| B-1.5 | `roi_persist`(待接通) | up/down layer 跨度 |
+| B-1.5 | `roi_persist=true` | 已实现(全程保持,见下) |
 
 ### 首跑务必
-- `ROI_DEBUG=1` 看 `[roi]` 行的 `virt_q/virt_k` 形状是否 `[B, P², Hh, D]`、noise_face 尺寸是否合理。
+- `ROI_DEBUG=1` 看 `[roi]`/`[roi-persist]` 行的形状是否合理。
 - 先测噪声底(同配置跑两遍),再对照 baseline / A′ / **crop-1k(上限)** 用脸 crop + ArcFace/Laplacian 判定清晰度。
 - 本机无 torch,代码仅过 py_compile;NPU 上若 `F.interpolate(bf16)` 或 `apply_rotary_emb` 广播报错,看 `ROI_DEBUG` 定位后告诉我。
+
+---
+
+## ✅ B-1.5 persist 已实现（全程保持 + 循环末降采样回写）
+
+实现方式(最稳的形态,避免循环中途改序列长度):
+- **循环前**(`_persist_append`):对每个 ID,从 noise 脸 native 区插值出 **P×P 高密度"脸影子"token**,**追加到 image 序列尾部**,扩展 `img_ids` 并重算 `concat_rotary_emb`(影子用 T=0、连续坐标覆盖脸框)。
+- **全程**:这些影子 token 跨**所有 double+single block** 用全注意力演化(noise 脸 native token 在 block 里也会 attend 到它们)。persist 时**自动关掉 per-layer ROI 与 native A′ 注入**,避免重复。
+- **循环后**(`_persist_collapse`):把影子 token 降采样回 native 脸尺寸,`noise_alpha` 残差融合进 noise 脸位置,再裁掉尾部 → 正常解码。
+
+### B-1.5 参数
+```yaml
+  use_id_patch_attention: true
+  patch_split_num: 1
+  id_patch_idx_double_window: [1, 3, 5, 7]   # persist 下生效层影响的是 lq/ref fixup；影子全程都在
+  id_patch_idx_single_window: [1, 3]
+  id_patch_fixup_lqref: false
+  id_patch_roi_mode: true
+  id_patch_roi_persist: true                 # ← 开 persist
+  id_patch_roi_size: 24                      # P；扫 {16,24,32}
+  id_patch_roi_pe_mode: "pe2"
+  id_patch_noise_alpha: 0.6                   # 末端回写强度；扫 {0.4,0.6,0.8}
+  id_patch_expand_ratio_ref: 2.0
+  id_patch_expand_ratio_lq: 1.5
+```
+
+### 当前限制(诚实)
+- **`roi_up_layer`/`roi_down_layer` 暂未生效**:本版是"全程保持、循环末统一降采样回写"。要"指定在第几层下采"需要在 block 循环中途改序列长度+重算 PE,留作下一步细化。
+- **输出仍从 native ~8×8 token 解码** → 脸尺寸/上限不变;persist 只验证"逐层降采样是否额外抹高频 + 让影子跨层演化"是否带来增益。**预期可能仍受 8×8 上限**(见本文开头分析),所以下一步是 A(高清 ref 重编码补真高频源)。
+- 影子 token 会被全图其他 token attend(全局注意力变化),可能更 OOD;若出问题用 `ROI_DEBUG=1` 看 `[roi-persist]`。

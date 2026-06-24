@@ -652,18 +652,11 @@ def _maybe_virtual_roi(
     output, q_pre, k_pre, v_pre, ranges, id_patch_pairs, latent_h, latent_w,
     id_patch_config, rope_theta, rope_axes_dim, backend, parallel_config,
 ):
-    """从 id_patch_config 取 Version B 参数并调用 _virtual_roi_qkv_attention。
-    persist 暂未接通（需 forward 改造），置 True 时告警并回退 per-layer。"""
+    """从 id_patch_config 取 Version B(per-layer)参数并调用 _virtual_roi_qkv_attention。
+    persist 模式由 forward 处理(_persist_append/_persist_collapse),不走这里。"""
     if rope_theta is None or rope_axes_dim is None:
         logger.warning("roi_mode 需要 rope_theta/rope_axes_dim，但未传入，跳过 Version B。")
         return output
-    if getattr(id_patch_config, "roi_persist", False):
-        global _ROI_PERSIST_WARNED
-        if not _ROI_PERSIST_WARNED:
-            logger.warning(
-                "roi_persist=True 尚未接通（需改 forward 的序列长度/位置编码），本次回退 per-layer。"
-            )
-            _ROI_PERSIST_WARNED = True
     return _virtual_roi_qkv_attention(
         output, q_pre, k_pre, v_pre, ranges, id_patch_pairs, latent_h, latent_w,
         P=getattr(id_patch_config, "roi_size", 24),
@@ -676,6 +669,57 @@ def _maybe_virtual_roi(
         rope_theta=rope_theta, axes_dim=rope_axes_dim,
         backend=backend, parallel_config=parallel_config,
     )
+
+
+def _persist_append(hidden_img, img_ids, pos_embed, text_rope, id_patch_config,
+                    id_patch_pairs, latent_h, latent_w):
+    """[B-1.5 persist] 在 image 序列尾部追加每个 ID 的 P×P 高密度"脸影子"token
+    (从 hidden_img 的 native 脸区插值而来),并扩展 img_ids、重算 concat_rotary_emb。
+    返回 (extended_hidden_img, new_concat_rope, persist_state)。
+    persist_state = {'faces': [(noise_local_idx, h_f, w_f, P, off)], 'total': int}
+    """
+    P = _as_int(getattr(id_patch_config, "roi_size", 24))
+    pe_mode = getattr(id_patch_config, "roi_pe_mode", "pe2")
+    dev = hidden_img.device
+    faces, appended, appended_ids, off = [], [], [], 0
+    for pair in id_patch_pairs:
+        ly1, lx1, ly2, lx2 = pair["lq"]
+        h_f, w_f = ly2 - ly1, lx2 - lx1
+        if h_f <= 0 or w_f <= 0:
+            continue
+        idx = _build_2d_rect_indices(ly1, lx1, ly2, lx2, latent_w, dev)   # noise 在 image 最前 → image-local index
+        face = hidden_img[:, idx].unsqueeze(2)                            # [B, h*w, 1, C]
+        face_hr = _resample_tokens_2d(face, h_f, w_f, P, P).squeeze(2)    # [B, P², C]
+        appended.append(face_hr)
+        appended_ids.append(_make_roi_pos_ids(pair["lq"], pair["lq"], P, _ROI_T_NOISE,
+                                              pe_mode, target_box=pair["lq"], device=dev))
+        faces.append((idx, h_f, w_f, P, off))
+        off += P * P
+    if not appended:
+        return hidden_img, None, None
+    hidden_ext = torch.cat([hidden_img, torch.cat(appended, dim=1)], dim=1)
+    img_ids_ext = torch.cat([img_ids.float(), torch.cat(appended_ids, dim=0).to(dev)], dim=0)
+    img_rope = pos_embed(img_ids_ext)
+    new_concat = (torch.cat([text_rope[0], img_rope[0]], dim=0),
+                  torch.cat([text_rope[1], img_rope[1]], dim=0))
+    if _ROI_DEBUG:
+        print(f"[roi-persist] append {off} tokens ({len(faces)} faces, P={P}), "
+              f"seq {hidden_img.shape[1]}->{hidden_ext.shape[1]}", flush=True)
+    return hidden_ext, new_concat, {"faces": faces, "total": off}
+
+
+def _persist_collapse(hidden_full, persist_state, num_txt_tokens, noise_alpha):
+    """[B-1.5 persist] 单流阶段后(hidden_full=[B, txt+image_ext, C]):把尾部 face 影子
+    降采样回 native,残差融合进 noise 脸位置,并裁掉尾部。返回裁剪后的 hidden_states。"""
+    total = persist_state["total"]
+    tail = hidden_full[:, -total:]
+    body = hidden_full[:, :-total]
+    for (idx, h_f, w_f, P, off) in persist_state["faces"]:
+        face_hr = tail[:, off:off + P * P].unsqueeze(2)                  # [B, P², 1, C]
+        native = _resample_tokens_2d(face_hr, P, P, h_f, w_f).squeeze(2)  # [B, h*w, C]
+        tgt = idx + num_txt_tokens                                       # noise 脸在 [txt,noise,...] 的全局位置
+        body[:, tgt] = (1.0 - noise_alpha) * body[:, tgt] + noise_alpha * native
+    return body
 
 
 # ============ Processor 类 ============
@@ -813,7 +857,7 @@ class Flux2AttnProcessor:
                 parallel_config=self._parallel_config,
             )
 
-            if roi_mode:
+            if roi_mode and not getattr(id_patch_config, "roi_persist", False):
                 hidden_states = _maybe_virtual_roi(
                     hidden_states, q_pre, k_pre, v_pre, ranges, id_patch_pairs,
                     latent_h, latent_w, id_patch_config, rope_theta, rope_axes_dim,
@@ -1005,7 +1049,7 @@ class Flux2ParallelSelfAttnProcessor:
                 parallel_config=self._parallel_config,
             )
 
-            if roi_mode:
+            if roi_mode and not getattr(id_patch_config, "roi_persist", False):
                 attn_output = _maybe_virtual_roi(
                     attn_output, q_pre, k_pre, v_pre, ranges, id_patch_pairs,
                     latent_h, latent_w, id_patch_config, rope_theta, rope_axes_dim,
@@ -1487,6 +1531,19 @@ class Flux2Transformer2DModel(
             torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
         )
 
+        # ============ Version B-1.5 persist：循环前在 image 尾部追加高密度脸影子 token ============
+        persist_state = None
+        if (id_patch_config is not None and id_patch_pairs and seq_noise is not None
+                and latent_h is not None
+                and getattr(id_patch_config, "roi_mode", False)
+                and getattr(id_patch_config, "roi_persist", False)):
+            hidden_states, _new_rope, persist_state = _persist_append(
+                hidden_states, img_ids, self.pos_embed, text_rotary_emb,
+                id_patch_config, id_patch_pairs, latent_h, latent_w,
+            )
+            if persist_state is not None:
+                concat_rotary_emb = _new_rope
+
         # ============ 构建 ID Patch 参数 ============
         id_patch_attention_kwargs = {}
         if id_patch_config is not None and id_patch_pairs is not None and seq_noise is not None and latent_h is not None:
@@ -1562,6 +1619,13 @@ class Flux2Transformer2DModel(
                     image_rotary_emb=concat_rotary_emb,
                     joint_attention_kwargs=block_attention_kwargs,
                 )
+
+        # ============ Version B-1.5 persist：循环后把脸影子降采样回写进 noise 脸并裁掉尾部 ============
+        if persist_state is not None:
+            hidden_states = _persist_collapse(
+                hidden_states, persist_state, num_txt_tokens,
+                getattr(id_patch_config, "noise_alpha", 0.5),
+            )
 
         hidden_states = hidden_states[:, num_txt_tokens:, ...]
 

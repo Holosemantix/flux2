@@ -56,5 +56,5 @@ docs/
 - **Version A（Expanded-KV Only）**：已实现并实测 → 小脸上无可见作用、被噪声淹没（`docs/05`）。
 - **Version A'（Noise-Fixup）**：已实现并实测 → 输出脸**机械上响应了 ref**(结果与 baseline 有别)，但**清晰度未提升**。结论:路径有效，瓶颈在小脸的细节源/分辨率容量。
 - **Version B（Virtual ROI-QKV · 单趟 · attention 内提分辨率 · 无 crop/无后处理）**：**已实现(per-layer)**。attention 里把人脸 ROI 用 ROIAlign 升到 P×P 虚拟 token、高密度 attend、降采样回 native、残差注入 noise 段;虚拟 token 重配 RoPE(pe1/pe2/pe3)。开关 `id_patch_roi_mode`。参数/phase 见 `docs/08`,改动见 `CHANGES` Version B 节。**首跑开 `ROI_DEBUG=1`**。
-- **persist(跨层保持高分辨率,B-1.5)**：开关已 scaffold(`roi_persist/roi_up_layer/roi_down_layer`),但**未接通**(需改 forward 序列长度+PE),置 true 仅告警回退 per-layer。
+- **persist(跨层保持高分辨率,B-1.5)**：**已实现**(`id_patch_roi_persist=true`)——循环前在 image 尾部追加 P×P 脸影子 token、全程跨 block 演化、循环末降采样回写进 noise 脸。`roi_up/down_layer` 暂未生效(恒为循环前/末)。输出仍 native 尺寸,预期可能仍受上限 → 下一步配合 A(高清 ref 重编码)补真高频源。
 - **多 ID 泄漏 mitigation**：已登记后续点(每脸独立 ROI 天然隔离)。

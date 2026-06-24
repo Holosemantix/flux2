@@ -31,9 +31,9 @@
 | `id_patch_roi_size` | int | 24 | **P**:虚拟 ROI 边长(token),attention 时的密度 |
 | `id_patch_roi_pe_mode` | str | "pe2" | 虚拟 token 位置编码:`pe1`/`pe2`/`pe3` |
 | `id_patch_roi_include_lq` | bool | true | 虚拟 KV 是否含 lq 结构 ROI(`[lq+ref]` vs 仅 `ref`) |
-| `id_patch_roi_persist` | bool | false | 跨层保持高分辨率(**未接通**,true 仅告警回退 per-layer) |
-| `id_patch_roi_up_layer` | int | -1 | persist 起始层(预留,未接通) |
-| `id_patch_roi_down_layer` | int | -1 | persist 下采回写层(预留,未接通) |
+| `id_patch_roi_persist` | bool | false | 跨层保持高分辨率(**已实现**:全程保持+循环末降采样回写) |
+| `id_patch_roi_up_layer` | int | -1 | persist 起始层(预留,当前版恒为"循环前") |
+| `id_patch_roi_down_layer` | int | -1 | persist 下采回写层(预留,当前版恒为"循环末") |
 
 > 还有 ID 匹配相关的 `id_match_conf_threshold / id_match_dist_threshold / id_match_imgsz` 和 YOLO/ReID 路径,不在本文范围,保持你现有值即可。
 
@@ -138,10 +138,11 @@ P×P 是新造的虚拟 token,必须重配位置 id 再 apply RoPE。三种:
 - `noise_alpha`(α):降采样回 native 后的残差融合强度,同 A'。建议 0.6 起。
 - `expand_min_size`:小脸 ROI 取样的最小边长兜底。
 
-### 2B.6 `roi_persist / roi_up_layer / roi_down_layer`（跨层保持,**未接通**）
-- 目的:不在每层都"上采→下采"(反复低通抹高频),而是**上采一次、连续多层保持 P×P、到指定层才下采**,让高频跨层累积。
-- 现状:**代码里仅 scaffold**。`roi_persist=true` 只会打印一次告警并**回退 per-layer**;真正实现需改 `forward` 的序列长度与位置编码(B-1.5 后续做)。
-- `roi_up_layer`/`roi_down_layer`:预留(上采起始层 / 下采回写层),接通后生效。
+### 2B.6 `roi_persist / roi_up_layer / roi_down_layer`（跨层保持,**已实现**）
+- 目的:不在每层都"上采→下采"(反复低通抹高频),而是让高密度"脸影子"**跨多层保持并演化**,最后再降采样回写,避免逐层抹高频。
+- 现状:`roi_persist=true` 时由 `forward` 处理 —— **循环前**追加 P×P 脸影子 token 到 image 尾部、**全程**跨所有 block 演化、**循环末**降采样回写进 noise 脸(`noise_alpha` 残差);persist 时自动关掉 per-layer ROI 与 native A′,避免重复。
+- `roi_up_layer`/`roi_down_layer`:**当前版未生效**(恒为"循环前/循环末")。要指定中途某层下采,需在 block 循环里改序列长度+重算 PE,留作后续。
+- ⚠️ 输出仍从 native 解码 → 脸尺寸不变;persist 主要验证"逐层降采样是否抹高频 + 跨层演化是否增益",预期可能仍受 native token 上限,下一步配合 **A(高清 ref 重编码)** 补真高频源。
 
 ---
 
