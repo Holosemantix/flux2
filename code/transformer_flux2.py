@@ -672,29 +672,60 @@ def _maybe_virtual_roi(
 
 
 def _persist_append(hidden_img, img_ids, pos_embed, text_rope, id_patch_config,
-                    id_patch_pairs, latent_h, latent_w):
-    """[B-1.5 persist] 在 image 序列尾部追加每个 ID 的 P×P 高密度"脸影子"token
-    (从 hidden_img 的 native 脸区插值而来),并扩展 img_ids、重算 concat_rotary_emb。
+                    id_patch_pairs, latent_h, latent_w, seq_noise, seq_lq):
+    """[B-1.5 persist · 三块影子] 对每个 ID,在 image 序列尾部追加 P×P 高密度"脸影子":
+      - noise 影子(query/写回):exact 脸框, noise 段, T=0
+      - lq 影子(结构):扩大脸框, lq 段, T=10
+      - ref 影子(细节):扩大脸框, ref 段, T=20
+    都是从对应段的 native 脸区**插值**而来;扩展 img_ids、重算 concat_rotary_emb。
     返回 (extended_hidden_img, new_concat_rope, persist_state)。
-    persist_state = {'faces': [(noise_local_idx, h_f, w_f, P, off)], 'total': int}
+    persist_state = {'faces': [(noise_local_idx, h_f, w_f, P, noise_off)], 'total': int}
+    （collapse 只回写 noise 影子;lq/ref 影子仅供注意力,丢弃。）
     """
     P = _as_int(getattr(id_patch_config, "roi_size", 24))
     pe_mode = getattr(id_patch_config, "roi_pe_mode", "pe2")
+    exp_lq = getattr(id_patch_config, "expand_ratio_lq", 1.0)
+    exp_ref = getattr(id_patch_config, "expand_ratio_ref", 1.0)
+    exp_min = getattr(id_patch_config, "expand_min_size", 0)
     dev = hidden_img.device
+    lq_base = seq_noise               # lq 段在 image 内的起点
+    ref_base = seq_noise + seq_lq     # ref 段在 image 内的起点
+
+    def _shadow(seg_base, box, t_val):
+        y1, x1, y2, x2 = box
+        idx = _build_2d_rect_indices(y1, x1, y2, x2, latent_w, dev) + seg_base
+        sh = _resample_tokens_2d(hidden_img[:, idx].unsqueeze(2), y2 - y1, x2 - x1, P, P).squeeze(2)
+        return sh                                                   # [B, P², C]
+
     faces, appended, appended_ids, off = [], [], [], 0
     for pair in id_patch_pairs:
-        ly1, lx1, ly2, lx2 = pair["lq"]
+        lq_bbox, ref_bbox = pair["lq"], pair["ref"]
+        ly1, lx1, ly2, lx2 = lq_bbox
         h_f, w_f = ly2 - ly1, lx2 - lx1
         if h_f <= 0 or w_f <= 0:
             continue
-        idx = _build_2d_rect_indices(ly1, lx1, ly2, lx2, latent_w, dev)   # noise 在 image 最前 → image-local index
-        face = hidden_img[:, idx].unsqueeze(2)                            # [B, h*w, 1, C]
-        face_hr = _resample_tokens_2d(face, h_f, w_f, P, P).squeeze(2)    # [B, P², C]
-        appended.append(face_hr)
-        appended_ids.append(_make_roi_pos_ids(pair["lq"], pair["lq"], P, _ROI_T_NOISE,
-                                              pe_mode, target_box=pair["lq"], device=dev))
-        faces.append((idx, h_f, w_f, P, off))
+        lq_exp = _expand_bbox(lq_bbox, exp_lq, exp_min, latent_h, latent_w)
+        ref_exp = _expand_bbox(ref_bbox, exp_ref, exp_min, latent_h, latent_w)
+
+        # noise 影子（query/写回）：exact 脸框
+        noise_off = off
+        appended.append(_shadow(0, lq_bbox, _ROI_T_NOISE))
+        appended_ids.append(_make_roi_pos_ids(lq_bbox, lq_bbox, P, _ROI_T_NOISE, "pe1",
+                                              target_box=lq_bbox, device=dev))
         off += P * P
+        # lq 影子（结构）：扩大脸框
+        appended.append(_shadow(lq_base, lq_exp, _ROI_T_LQ))
+        appended_ids.append(_make_roi_pos_ids(lq_exp, lq_bbox, P, _ROI_T_LQ, pe_mode,
+                                              target_box=lq_bbox, device=dev))
+        off += P * P
+        # ref 影子（细节）：扩大脸框
+        appended.append(_shadow(ref_base, ref_exp, _ROI_T_REF))
+        appended_ids.append(_make_roi_pos_ids(ref_exp, ref_bbox, P, _ROI_T_REF, pe_mode,
+                                              target_box=lq_bbox, device=dev))
+        off += P * P
+
+        faces.append((_build_2d_rect_indices(ly1, lx1, ly2, lx2, latent_w, dev), h_f, w_f, P, noise_off))
+
     if not appended:
         return hidden_img, None, None
     hidden_ext = torch.cat([hidden_img, torch.cat(appended, dim=1)], dim=1)
@@ -703,19 +734,19 @@ def _persist_append(hidden_img, img_ids, pos_embed, text_rope, id_patch_config,
     new_concat = (torch.cat([text_rope[0], img_rope[0]], dim=0),
                   torch.cat([text_rope[1], img_rope[1]], dim=0))
     if _ROI_DEBUG:
-        print(f"[roi-persist] append {off} tokens ({len(faces)} faces, P={P}), "
+        print(f"[roi-persist] 3-shadow append {off} tokens ({len(faces)} faces x3, P={P}), "
               f"seq {hidden_img.shape[1]}->{hidden_ext.shape[1]}", flush=True)
     return hidden_ext, new_concat, {"faces": faces, "total": off}
 
 
 def _persist_collapse(hidden_full, persist_state, num_txt_tokens, noise_alpha):
-    """[B-1.5 persist] 单流阶段后(hidden_full=[B, txt+image_ext, C]):把尾部 face 影子
-    降采样回 native,残差融合进 noise 脸位置,并裁掉尾部。返回裁剪后的 hidden_states。"""
+    """[B-1.5 persist] 单流阶段后(hidden_full=[B, txt+image_ext, C]):把每个 ID 的
+    **noise 影子**降采样回 native,残差融合进 noise 脸位置;lq/ref 影子丢弃,裁掉全部尾部。"""
     total = persist_state["total"]
     tail = hidden_full[:, -total:]
     body = hidden_full[:, :-total]
-    for (idx, h_f, w_f, P, off) in persist_state["faces"]:
-        face_hr = tail[:, off:off + P * P].unsqueeze(2)                  # [B, P², 1, C]
+    for (idx, h_f, w_f, P, noise_off) in persist_state["faces"]:
+        face_hr = tail[:, noise_off:noise_off + P * P].unsqueeze(2)       # [B, P², 1, C]
         native = _resample_tokens_2d(face_hr, P, P, h_f, w_f).squeeze(2)  # [B, h*w, C]
         tgt = idx + num_txt_tokens                                       # noise 脸在 [txt,noise,...] 的全局位置
         body[:, tgt] = (1.0 - noise_alpha) * body[:, tgt] + noise_alpha * native
@@ -1540,6 +1571,7 @@ class Flux2Transformer2DModel(
             hidden_states, _new_rope, persist_state = _persist_append(
                 hidden_states, img_ids, self.pos_embed, text_rotary_emb,
                 id_patch_config, id_patch_pairs, latent_h, latent_w,
+                seq_noise, (seq_lq or 0),
             )
             if persist_state is not None:
                 concat_rotary_emb = _new_rope

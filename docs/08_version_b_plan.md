@@ -138,10 +138,16 @@ Dit:
 
 ## ✅ B-1.5 persist 已实现（全程保持 + 循环末降采样回写）
 
-实现方式(最稳的形态,避免循环中途改序列长度):
-- **循环前**(`_persist_append`):对每个 ID,从 noise 脸 native 区插值出 **P×P 高密度"脸影子"token**,**追加到 image 序列尾部**,扩展 `img_ids` 并重算 `concat_rotary_emb`(影子用 T=0、连续坐标覆盖脸框)。
-- **全程**:这些影子 token 跨**所有 double+single block** 用全注意力演化(noise 脸 native token 在 block 里也会 attend 到它们)。persist 时**自动关掉 per-layer ROI 与 native A′ 注入**,避免重复。
-- **循环后**(`_persist_collapse`):把影子 token 降采样回 native 脸尺寸,`noise_alpha` 残差融合进 noise 脸位置,再裁掉尾部 → 正常解码。
+实现方式(最稳的形态,避免循环中途改序列长度;**三块影子,都插值**):
+- **循环前**(`_persist_append`):对每个 ID,从对应段 native 脸区**插值**出 **3 块 P×P 高密度"脸影子"**,追加到 image 序列尾部:
+  - **noise 影子**(query/写回):exact 脸框,T=0,PE 连续;
+  - **lq 影子**(结构):扩大脸框(`expand_ratio_lq`),T=10,PE 按 `roi_pe_mode`;
+  - **ref 影子**(细节):扩大脸框(`expand_ratio_ref`),T=20,PE 按 `roi_pe_mode`(pe3 映射到 target 脸)。
+  扩展 `img_ids` 并重算 `concat_rotary_emb`。
+- **全程**:这些影子跨**所有 double+single block** 用全注意力演化(三块影子在同位置高密度互相 attend;native token 也 attend 它们)。persist 时**自动关掉 per-layer ROI 与 native A′ 注入**。
+- **循环后**(`_persist_collapse`):只把 **noise 影子**降采样回 native、`noise_alpha` 残差融合进 noise 脸;lq/ref 影子丢弃,裁掉尾部 → 正常解码。
+
+> ⚠️ 注意:影子在**全注意力**里(不是受限 ROI),noise 影子仍会被整图稀释;若没效果,下一步要么改"受限影子注意力",要么直接上 A(给 ref 影子换真高频)。
 
 ### B-1.5 参数
 ```yaml

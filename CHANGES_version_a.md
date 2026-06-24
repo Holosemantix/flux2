@@ -267,7 +267,8 @@ dit_params['id_patch_roi_down_layer'] = self.cfg.get('id_patch_roi_down_layer', 
 
 ## B-1.5 persist（已实现）
 - `transformer_flux2.py` 新增 `_persist_append` / `_persist_collapse`;`forward` 在 block 循环前/后各调一次;两个 processor 的 per-layer ROI 在 `roi_persist=True` 时关闭(`roi_mode and not roi_persist`)。
-- 形态:**循环前**在 image 尾部追加每个 ID 的 P×P "脸影子" token(扩展 `img_ids`+重算 `concat_rotary_emb`)→ **全程**跨所有 block 全注意力演化 → **循环末** `_persist_collapse` 降采样回写进 noise 脸、裁掉尾部。
+- 形态:**循环前**在 image 尾部追加每个 ID 的 **3 块** P×P "脸影子"(noise=exact 脸框/写回、lq=扩大/结构、ref=扩大/细节,分别 T=0/10/20,都插值)→ **全程**跨所有 block 全注意力演化 → **循环末** `_persist_collapse` 只把 **noise 影子**降采样回写进 noise 脸、lq/ref 影子丢弃、裁掉尾部。
+- `_persist_append` 多收 `seq_noise/seq_lq` 以定位 lq/ref 段。
 - 限制:`roi_up_layer`/`roi_down_layer` 暂未生效(恒为循环前/循环末);输出仍 native 尺寸。
 - cfg:`id_patch_roi_persist: true`(透传已在 B-3 的 7 行里)。
 
