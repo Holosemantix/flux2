@@ -18,8 +18,9 @@ FLUX.2 多参考 refiner / 合影超分场景下的 **training-free 实验**：�
 README.md
 CHANGES_version_a.md          # ★ 精确改动清单（Version A + A'），合入真实仓按这个
 code/
-  transformer_flux2.py        # 改好的整份（含 A + A'，合入前请 diff）
-  refine_model.py             # 改好的整份（含 A + A'）
+  transformer_flux2.py        # 改好的整份（含 Version A/A'/B，合入前请 diff）
+  refine_model.py             # 改好的整份（含 Version A/A'/B）
+  Dit_pipeline.py             # 改好的整份（含尾逗号 bug 修复 + Version A 的 ref 重编码）
 docs/
   01_background_and_mechanism.md   # 现有机制 + 坐标系确认 + 关键认知校正
   02_version_a_design.md           # Version A 设计 + 正确性核对步骤
