@@ -60,7 +60,7 @@ q_i \in \mathbb{R}^{H \times d}, \quad i=1,\dots,N_f
 其中 `H` 是 attention head 数，`d` 是每个 head 的维度。普通 A′ 直接用这个 `q_i` attend 到局部 lq/ref K/V：
 
 ```math
-z_i = \operatorname{Attn}(q_i, K_{lq}\oplus K_{ref}, V_{lq}\oplus V_{ref})
+z_i = \mathrm{Attn}(q_i, K_{lq}\oplus K_{ref}, V_{lq}\oplus V_{ref})
 ```
 
 问题是：当小脸只有 `8–12` 个 native token 时，每个 `q_i` 的空间采样很粗，`q_i` 和 ref face token 的匹配粒度不足。
@@ -81,9 +81,9 @@ z_i = \operatorname{Attn}(q_i, K_{lq}\oplus K_{ref}, V_{lq}\oplus V_{ref})
 \tilde{p}_{i,a,b}
 =
 \left(
-T_{noise},\
-y_i + \frac{a+0.5}{m} - 0.5,\
-x_i + \frac{b+0.5}{m} - 0.5,\
+T_{noise},
+y_i + \frac{a+0.5}{m} - 0.5,
+x_i + \frac{b+0.5}{m} - 0.5,
 0
 \right)
 ```
@@ -91,23 +91,48 @@ x_i + \frac{b+0.5}{m} - 0.5,\
 然后对 sub-query 重新施加 RoPE：
 
 ```math
-\tilde{q}_{i,a,b} = \operatorname{RoPE}(\tilde{q}_{i,a,b}^{raw}, \tilde{p}_{i,a,b})
+\tilde{q}_{i,a,b} = \mathrm{RoPE}(\tilde{q}_{i,a,b}^{raw}, \tilde{p}_{i,a,b})
 ```
 
 直观解释：每个 native token 内部放 `m×m` 个“探针”，探针不是新 latent，也不是新像素，只是在 attention logits 里用更细的相位位置去询问 ref/lq。
+
+### 3.2.1 为什么只改变 RoPE 位置，而不改变 query 内容
+
+这个设计的关键是把“内容是什么”和“从哪里看”分开。
+
+- `q_i` 的内容向量来自当前 denoising 状态下的 native noise face token，里面包含模型此刻对这块脸的语义、结构、身份线索和噪声状态。如果对 `q_i` 本身做 bilinear 上采样、MLP 生成或插值变换，就等于构造了模型训练时没见过的新 latent query 内容，容易产生 OOD 行为。
+- RoPE 位置只影响 attention score 里的相对相位关系。也就是说，改变 `\tilde{p}_{i,a,b}` 主要改变这个 query “以哪个子 token 位置去看 ref/lq K”，而不是强行创造新的 latent 内容。
+- 小脸 native token 少的问题，未必首先是“内容向量不够多”，也可能是“一个粗 query 只能以一个相位位置匹配 ref”。把同一个 `q_i` 放到 token 内部多个子位置，相当于用多个相邻视角去搜索 ref/lq 里哪个 K 更匹配。
+- 旧 B 的失败来自 `Interp(V)` 和 `Downsample(O)` 的低通链路；B-2 不插值 value，也不下采样虚拟 latent output，只对 attention logits 做更细采样，因此它是在验证“匹配分辨率”这个独立因素。
+
+更形式化地说，普通 attention 的 score 是：
+
+```math
+A_{ij} = \frac{\langle \mathrm{RoPE}(q_i,p_i),\mathrm{RoPE}(k_j,p_j)\rangle}{\sqrt{d}}
+```
+
+B-2 不改变 `q_i` 的内容，只把一个 score 变成 `m^2` 个子位置 score：
+
+```math
+A_{i,a,b,j} = \frac{\langle \mathrm{RoPE}(q_i,\tilde{p}_{i,a,b}),\mathrm{RoPE}(k_j,p_j)\rangle}{\sqrt{d}}
+```
+
+然后在 `m^2` 个子位置上得到多个 attention output，再聚合回 native token。这样做的含义是：**提高 query 的位置探测密度，而不是提高 latent 内容分辨率**。
+
+这也是它和 ref crop 重编码的根本区别：ref crop 重编码给模型新增真高频 K/V；B-2 不新增真高频源，只测试更细粒度的 query-position probing 是否能更好利用已有 native ref K/V。
 
 ### 3.3 native lq/ref K/V，不做 P×P 插值
 
 lq 结构分支的 key/value 直接取 native lq ROI：
 
 ```math
-K_l, V_l = K/V(\operatorname{ROI}_{lq}^{exp})
+K_l, V_l = K/V(\mathrm{ROI}_{lq}^{exp})
 ```
 
 ref 细节分支的 key/value 直接取 native ref ROI：
 
 ```math
-K_r, V_r = K/V(\operatorname{ROI}_{ref}^{exp})
+K_r, V_r = K/V(\mathrm{ROI}_{ref}^{exp})
 ```
 
 其中 `exp` 表示外扩 bbox，例如 `expand_ratio_lq=1.5`、`expand_ratio_ref=2.0`。这些 K/V 是原始模型已经投影出的 native K/V，不做 ROIAlign 上采样，不做 latent value 插值。
@@ -122,7 +147,7 @@ p_{r \rightarrow t}
 因此：
 
 ```math
-K_r^{rope} = \operatorname{RoPE}(K_r, \Phi_{r\rightarrow t}(p_r))
+K_r^{rope} = \mathrm{RoPE}(K_r, \Phi_{r\rightarrow t}(p_r))
 ```
 
 ### 3.4 split-branch attention：避免 lq/ref 互相稀释
@@ -130,19 +155,19 @@ K_r^{rope} = \operatorname{RoPE}(K_r, \Phi_{r\rightarrow t}(p_r))
 如果把 lq 和 ref 直接 concat 到一个 softmax：
 
 ```math
-\operatorname{Attn}(\tilde{q}, K_l \oplus K_r, V_l \oplus V_r)
+\mathrm{Attn}(\tilde{q}, K_l \oplus K_r, V_l \oplus V_r)
 ```
 
 ref 细节很容易被 lq 结构 token 稀释。B-2 默认用 split branch：
 
 ```math
 s_{i,a,b}^{lq}
-= \operatorname{Attn}(\tilde{q}_{i,a,b}, K_l, V_l)
+= \mathrm{Attn}(\tilde{q}_{i,a,b}, K_l, V_l)
 ```
 
 ```math
 s_{i,a,b}^{ref}
-= \operatorname{Attn}(\tilde{q}_{i,a,b}, K_r, V_r)
+= \mathrm{Attn}(\tilde{q}_{i,a,b}, K_r, V_r)
 ```
 
 再用 `detail_beta = \beta` 融合：
@@ -160,7 +185,7 @@ s_{i,a,b}
 
 ```math
 \bar{s}_i
-= \operatorname{Agg}_{a,b}(s_{i,a,b})
+= \mathrm{Agg}_{a,b}(s_{i,a,b})
 ```
 
 当前实现先用 mean：
@@ -190,19 +215,19 @@ o_i^{new}
 
 ```math
 Q^{P\times P}, K^{P\times P}, V^{P\times P}
-= \operatorname{Interp}(Q,K,V)
+= \mathrm{Interp}(Q,K,V)
 ```
 
 然后：
 
 ```math
-O^{P\times P}=\operatorname{Attn}(Q^{P\times P},K^{P\times P},V^{P\times P})
+O^{P\times P}=\mathrm{Attn}(Q^{P\times P},K^{P\times P},V^{P\times P})
 ```
 
 最后：
 
 ```math
-O^{native}=\operatorname{Downsample}(O^{P\times P})
+O^{native}=\mathrm{Downsample}(O^{P\times P})
 ```
 
 这条路径有两次低通风险：`Interp` 和 `Downsample`。
@@ -210,11 +235,11 @@ O^{native}=\operatorname{Downsample}(O^{P\times P})
 B-2 是 query 探针上采样：
 
 ```math
-\tilde{Q}=\operatorname{Repeat}(Q) + \operatorname{SubtokenRoPE}
+\tilde{Q}=\mathrm{Repeat}(Q) + \mathrm{SubtokenRoPE}
 ```
 
 ```math
-\bar{O}^{native}=\operatorname{Agg}(\operatorname{Attn}(\tilde{Q},K^{native},V^{native}))
+\bar{O}^{native}=\mathrm{Agg}(\mathrm{Attn}(\tilde{Q},K^{native},V^{native}))
 ```
 
 没有 `Interp(V)`，也没有 `Downsample(O)`，因此不会因为 value 插值和 latent 下采样天然变糊。
