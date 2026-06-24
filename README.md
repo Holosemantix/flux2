@@ -30,6 +30,7 @@ docs/
   07_parameter_reference.md        # ★ 所有参数含义 + Phase 1 配置逐行解释
   08_version_b_plan.md             # ★ Version B(提分辨率/细节容量) 实验计划
   09_findings_B_and_pe.md          # ★ B 实测:per-layer 无效/persist 模糊/PE 已排除/单趟下采上限
+  10_bugfix_and_versionA_plan.md   # ★ Dit_pipeline 尾逗号 bug + 当前结论 + Version A 实现计划
 ```
 
 > `Dit_pipeline.py` 文件大、改动仅 3 行，未整份重放——补丁见 `CHANGES_version_a.md` 第 3 节。

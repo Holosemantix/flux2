@@ -275,3 +275,27 @@ dit_params['id_patch_roi_down_layer'] = self.cfg.get('id_patch_roi_down_layer', 
 
 ## 注意
 - 本机无 torch,代码仅过 `py_compile`;**NPU 首跑请 `ROI_DEBUG=1`** 核对 `[roi]`/`[roi-persist]` 形状与 PE。
+
+---
+
+# 🔴 Bugfix：Dit_pipeline `load_modules` roi 参数尾逗号
+
+现状(错误)——每行尾部多了 `,`,导致值变成 1-tuple：
+```python
+dit_params['id_patch_roi_mode']=self.cfg.get('id_patch_roi_mode', False),   # → (False,)
+dit_params['id_patch_roi_size']=self.cfg.get('id_patch_roi_size', 24),       # → (24,)
+... (8 行都带尾逗号)
+```
+后果:`roi_size/roi_max_faces` 变 tuple(报错源头);`roi_pe_mode=('pe2',)` 永不匹配 → 恒走 pe1;`roi_mode/roi_persist/roi_include_lq` 为 `(bool,)` 非空 tuple **恒真**(关不掉)。
+
+修复(删尾逗号 + max_faces 默认 -1)：
+```python
+            dit_params['id_patch_roi_mode'] = self.cfg.get('id_patch_roi_mode', False)
+            dit_params['id_patch_roi_size'] = self.cfg.get('id_patch_roi_size', 24)
+            dit_params['id_patch_roi_pe_mode'] = self.cfg.get('id_patch_roi_pe_mode', 'pe2')
+            dit_params['id_patch_roi_include_lq'] = self.cfg.get('id_patch_roi_include_lq', True)
+            dit_params['id_patch_roi_persist'] = self.cfg.get('id_patch_roi_persist', False)
+            dit_params['id_patch_roi_max_faces'] = self.cfg.get('id_patch_roi_max_faces', -1)
+            dit_params['id_patch_roi_up_layer'] = self.cfg.get('id_patch_roi_up_layer', -1)
+            dit_params['id_patch_roi_down_layer'] = self.cfg.get('id_patch_roi_down_layer', -1)
+```
