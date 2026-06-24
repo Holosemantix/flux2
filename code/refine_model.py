@@ -71,6 +71,9 @@ class IdPatchConfig:
     roi_persist: bool = False
     roi_up_layer: int = -1
     roi_down_layer: int = -1
+    # ===== Version A（真·高清 ref 重编码）=====
+    roi_ref_reencode: bool = False
+    ref_crop_size: int = 512
 
 
 class RefinerModel(object):
@@ -162,6 +165,8 @@ class RefinerModel(object):
                 roi_persist=kwargs.get('id_patch_roi_persist', False),
                 roi_up_layer=kwargs.get('id_patch_roi_up_layer', -1),
                 roi_down_layer=kwargs.get('id_patch_roi_down_layer', -1),
+                roi_ref_reencode=kwargs.get('id_patch_roi_ref_reencode', False),
+                ref_crop_size=kwargs.get('id_patch_ref_crop_size', 512),
             )
             if self.rank == 0:
                 print(f"\n---ID Patch Attention enabled with config: {self.id_patch_config}")
@@ -174,11 +179,29 @@ class RefinerModel(object):
                 data[i] = self.transfer_torch_data(data[i])
         return data
 
+    @staticmethod
+    def _ref_hr_pos_ids(gh, gw, tbox, t_val=20):
+        """[Version A] 把 gh×gw 的高清 ref token 网格映射到 target(lq)脸框坐标，stream T=t_val。
+        返回 [gh*gw, 4] 的 (T,H,W,L) 连续坐标 id。"""
+        y1, x1, y2, x2 = tbox
+        ys = torch.linspace(float(y1), float(y2), gh)
+        xs = torch.linspace(float(x1), float(x2), gw)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+        gy = gy.reshape(-1)
+        gx = gx.reshape(-1)
+        t = torch.full_like(gy, float(t_val))
+        l = torch.zeros_like(gy)
+        return torch.stack([t, gy, gx, l], dim=-1)
+
     def __call__(self, data):
         ori_device = data[0].device
 
-        # 提取 id_patch_pairs（Python 对象，不需要 transfer_torch_data）
+        # 提取 id_patch_pairs / ref_hr_latents（Python 对象）
         id_patch_pairs = None
+        ref_hr_latents = None
+        if len(data) > 7 and isinstance(data[7], list):
+            ref_hr_latents = data[7]
+            data = data[:7]
         if len(data) > 6 and isinstance(data[6], list):
             id_patch_pairs = data[6]
             data = data[:6]
@@ -234,6 +257,36 @@ class RefinerModel(object):
             seq_ref = packed_ref_model_input_2.size(1)
         else:
             seq_ref = 0
+
+        # ============ Version A：拼入高清 ref_hr token + 映射到 target 脸框的 PE ============
+        if ref_hr_latents and id_patch_pairs:
+            base = seq_noise + seq_lq + seq_ref           # ref_hr 在 image 序列里的起点(image-local)
+            cur = base
+            B = latent_model_input.shape[0]
+            rh_packed_list, rh_ids_list = [], []
+            for k, lat in enumerate(ref_hr_latents):
+                if lat is None or lat.dim() != 4 or k >= len(id_patch_pairs):
+                    continue
+                lat = lat.to(self.device).to(latent_model_input.dtype)
+                gh, gw = lat.shape[2], lat.shape[3]
+                packed = KleinLatentProcessor.pack_latents(lat)        # [1, gh*gw, C]
+                if packed.shape[0] != B:
+                    packed = packed.expand(B, -1, -1)
+                ids = self._ref_hr_pos_ids(gh, gw, id_patch_pairs[k]['lq'], t_val=20)  # [gh*gw,4]
+                ids = ids.unsqueeze(0).expand(B, -1, -1)
+                rh_packed_list.append(packed)
+                rh_ids_list.append(ids)
+                n = gh * gw
+                id_patch_pairs[k]['ref_hr'] = (cur, cur + n)           # image-local range
+                cur += n
+            if rh_packed_list:
+                rh_packed = torch.cat(rh_packed_list, dim=1).to(self.device)
+                rh_ids = torch.cat(rh_ids_list, dim=1).to(self.device)
+                latent_model_input = torch.cat([latent_model_input, rh_packed], dim=1)
+                latent_image_ids = torch.cat([latent_image_ids.float(), rh_ids.float()], dim=1)
+                if self.rank == 0:
+                    print(f"---Version A: appended {cur - base} ref_hr tokens "
+                          f"({len(rh_packed_list)} faces), seq -> {latent_model_input.size(1)}")
 
         # 构建 transformer 调用参数
         transformer_kwargs = {

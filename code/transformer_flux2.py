@@ -79,6 +79,10 @@ class IdPatchConfig:
     roi_persist: bool = False
     roi_up_layer: int = -1
     roi_down_layer: int = -1
+    # ===== Version A（真·高清 ref 重编码）=====
+    # noise 脸 query(native,不上采)attend 序列里的高清 ref_hr token(真高频),残差注入。
+    roi_ref_reencode: bool = False
+    ref_crop_size: int = 512      # ref 脸 crop 在像素空间 resize 到的边长(/16);Dit_pipeline 用
 
 
 def _get_projections(attn: "Flux2Attention", hidden_states, encoder_hidden_states=None):
@@ -672,6 +676,56 @@ def _maybe_virtual_roi(
     )
 
 
+def _ref_hr_attention(
+    output: torch.Tensor,
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+    ranges: Dict[str, Tuple[int, int]],
+    id_patch_pairs: List[Dict],
+    latent_h: int, latent_w: int,
+    exp_lq: float, exp_min: int, noise_alpha: float,
+    backend=None, parallel_config=None,
+) -> torch.Tensor:
+    """
+    Version A：noise 脸 query（native，原始 bbox，不上采→不引入低通糊）attend
+    一个紧凑 KV = [局部 lq(结构) + 高清 ref_hr token(真高频，已在序列里、已被投影+RoPE)]，
+    noise_alpha 残差写回 noise 脸。
+    每个 pair 需带 'ref_hr'=(img_local_start, img_local_end)（refine_model 写入）。
+    用 POST-RoPE 的 q/k/v（ref_hr 在序列里，已 RoPE）。
+    """
+    B, S, H, D = query.shape
+    noise_start, _ = ranges["noise"]
+    lq_start, lq_end = ranges["lq"]
+    dev = query.device
+    for pair in id_patch_pairs:
+        rh = pair.get("ref_hr")
+        if rh is None:
+            continue
+        ly1, lx1, ly2, lx2 = pair["lq"]
+        if (ly2 - ly1) <= 0 or (lx2 - lx1) <= 0:
+            continue
+        nq_idx = _build_2d_rect_indices(ly1, lx1, ly2, lx2, latent_w, dev) + noise_start
+        noise_q = query[:, nq_idx]                                  # native，不重采样
+
+        # 结构：局部(扩大) lq 区域
+        ey1, ex1, ey2, ex2 = _expand_bbox(pair["lq"], exp_lq, exp_min, latent_h, latent_w)
+        lk_idx = _build_2d_rect_indices(ey1, ex1, ey2, ex2, latent_w, dev) + lq_start
+        k_struct, v_struct = key[:, lk_idx], value[:, lk_idx]
+
+        # 细节：高清 ref_hr 段（global = noise_start + image-local）
+        g0, g1 = noise_start + int(rh[0]), noise_start + int(rh[1])
+        k_detail, v_detail = key[:, g0:g1], value[:, g0:g1]
+
+        ck = torch.cat([k_struct, k_detail], dim=1)
+        cv = torch.cat([v_struct, v_detail], dim=1)
+        if _ROI_DEBUG:
+            print(f"[refhr] noise_q={tuple(noise_q.shape)} lq_struct={k_struct.shape[1]} "
+                  f"ref_hr={k_detail.shape[1]} (range {g0}:{g1})", flush=True)
+        out_i = _dispatch_attention(noise_q, ck, cv, num_heads=H,
+                                    backend=backend, parallel_config=parallel_config)
+        output[:, nq_idx] = (1.0 - noise_alpha) * output[:, nq_idx] + noise_alpha * out_i
+    return output
+
+
 def _persist_append(hidden_img, img_ids, pos_embed, text_rope, id_patch_config,
                     id_patch_pairs, latent_h, latent_w, seq_noise, seq_lq):
     """[B-1.5 persist · 三块影子] 对每个 ID,在 image 序列尾部追加 P×P 高密度"脸影子":
@@ -879,6 +933,7 @@ class Flux2AttnProcessor:
             st = txt_len
             ranges = _compute_segment_ranges(st, sn, sl, sr, img_first=False)
             roi_mode = getattr(id_patch_config, "roi_mode", False)
+            ref_reencode = getattr(id_patch_config, "roi_ref_reencode", False)
 
             hidden_states = _id_patch_attention(
                 query, key, value,
@@ -890,14 +945,23 @@ class Flux2AttnProcessor:
                 expand_ratio_ref=getattr(id_patch_config, "expand_ratio_ref", 1.0),
                 expand_min_size=getattr(id_patch_config, "expand_min_size", 0),
                 fixup_lqref=getattr(id_patch_config, "fixup_lqref", True),
-                # roi_mode 时 noise 注入交给 Version B，避免重复
-                fixup_noise=getattr(id_patch_config, "fixup_noise", False) and not roi_mode,
+                # roi_mode / ref_reencode 时 noise 注入交给对应路径，避免重复
+                fixup_noise=getattr(id_patch_config, "fixup_noise", False) and not roi_mode and not ref_reencode,
                 noise_alpha=getattr(id_patch_config, "noise_alpha", 0.5),
                 backend=self._attention_backend,
                 parallel_config=self._parallel_config,
             )
 
-            if roi_mode and not getattr(id_patch_config, "roi_persist", False):
+            if ref_reencode:
+                # Version A：noise 脸 query attend 序列里的高清 ref_hr token
+                hidden_states = _ref_hr_attention(
+                    hidden_states, query, key, value, ranges, id_patch_pairs, latent_h, latent_w,
+                    exp_lq=getattr(id_patch_config, "expand_ratio_lq", 1.0),
+                    exp_min=getattr(id_patch_config, "expand_min_size", 0),
+                    noise_alpha=getattr(id_patch_config, "noise_alpha", 0.5),
+                    backend=self._attention_backend, parallel_config=self._parallel_config,
+                )
+            elif roi_mode and not getattr(id_patch_config, "roi_persist", False):
                 hidden_states = _maybe_virtual_roi(
                     hidden_states, q_pre, k_pre, v_pre, ranges, id_patch_pairs,
                     latent_h, latent_w, id_patch_config, rope_theta, rope_axes_dim,
@@ -1072,6 +1136,7 @@ class Flux2ParallelSelfAttnProcessor:
             st = txt_len
             ranges = _compute_segment_ranges(st, sn, sl, sr, img_first=False)
             roi_mode = getattr(id_patch_config, "roi_mode", False)
+            ref_reencode = getattr(id_patch_config, "roi_ref_reencode", False)
 
             attn_output = _id_patch_attention(
                 query, key, value,
@@ -1083,13 +1148,21 @@ class Flux2ParallelSelfAttnProcessor:
                 expand_ratio_ref=getattr(id_patch_config, "expand_ratio_ref", 1.0),
                 expand_min_size=getattr(id_patch_config, "expand_min_size", 0),
                 fixup_lqref=getattr(id_patch_config, "fixup_lqref", True),
-                fixup_noise=getattr(id_patch_config, "fixup_noise", False) and not roi_mode,
+                fixup_noise=getattr(id_patch_config, "fixup_noise", False) and not roi_mode and not ref_reencode,
                 noise_alpha=getattr(id_patch_config, "noise_alpha", 0.5),
                 backend=self._attention_backend,
                 parallel_config=self._parallel_config,
             )
 
-            if roi_mode and not getattr(id_patch_config, "roi_persist", False):
+            if ref_reencode:
+                attn_output = _ref_hr_attention(
+                    attn_output, query, key, value, ranges, id_patch_pairs, latent_h, latent_w,
+                    exp_lq=getattr(id_patch_config, "expand_ratio_lq", 1.0),
+                    exp_min=getattr(id_patch_config, "expand_min_size", 0),
+                    noise_alpha=getattr(id_patch_config, "noise_alpha", 0.5),
+                    backend=self._attention_backend, parallel_config=self._parallel_config,
+                )
+            elif roi_mode and not getattr(id_patch_config, "roi_persist", False):
                 attn_output = _maybe_virtual_roi(
                     attn_output, q_pre, k_pre, v_pre, ranges, id_patch_pairs,
                     latent_h, latent_w, id_patch_config, rope_theta, rope_axes_dim,

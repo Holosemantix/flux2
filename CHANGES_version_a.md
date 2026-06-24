@@ -288,7 +288,7 @@ dit_params['id_patch_roi_size']=self.cfg.get('id_patch_roi_size', 24),       # �
 ```
 后果:`roi_size/roi_max_faces` 变 tuple(报错源头);`roi_pe_mode=('pe2',)` 永不匹配 → 恒走 pe1;`roi_mode/roi_persist/roi_include_lq` 为 `(bool,)` 非空 tuple **恒真**(关不掉)。
 
-修复(删尾逗号 + max_faces 默认 -1)：
+修复(删尾逗号 + max_faces 默认 -1 + 加 Version A 两行)：
 ```python
             dit_params['id_patch_roi_mode'] = self.cfg.get('id_patch_roi_mode', False)
             dit_params['id_patch_roi_size'] = self.cfg.get('id_patch_roi_size', 24)
@@ -298,4 +298,76 @@ dit_params['id_patch_roi_size']=self.cfg.get('id_patch_roi_size', 24),       # �
             dit_params['id_patch_roi_max_faces'] = self.cfg.get('id_patch_roi_max_faces', -1)
             dit_params['id_patch_roi_up_layer'] = self.cfg.get('id_patch_roi_up_layer', -1)
             dit_params['id_patch_roi_down_layer'] = self.cfg.get('id_patch_roi_down_layer', -1)
+            dit_params['id_patch_roi_ref_reencode'] = self.cfg.get('id_patch_roi_ref_reencode', False)
+            dit_params['id_patch_ref_crop_size'] = self.cfg.get('id_patch_ref_crop_size', 512)
+```
+
+---
+
+# Version A 改动清单（真·高清 ref 重编码）
+
+> noise 脸 query(native,不上采)attend 从 ref 像素 crop 重编码的真·高清 token。单趟、输出无后处理。
+> `code/transformer_flux2.py` 和 `code/refine_model.py` 已是含 A 的整份文件。`Dit_pipeline.py` 见下面 2 处 patch。
+
+## A-1. `transformer_flux2.py`（已改好）
+- `IdPatchConfig` 加 `roi_ref_reencode: bool=False`、`ref_crop_size: int=512`。
+- 新增 `_ref_hr_attention`:noise 脸 query(原始 bbox)attend `[局部 lq(扩大,结构) + key[ref_hr 全局 range](真高清细节)]`,`noise_alpha` 残差写回;用 POST-RoPE q/k/v(ref_hr 已在序列里、已 RoPE)。
+- 两个 processor:`ref_reencode` 时关掉 `_id_patch_attention` 的 `fixup_noise`,并在其后调用 `_ref_hr_attention`(优先于 roi_mode/persist)。
+
+## A-2. `refine_model.py`（已改好）
+- `IdPatchConfig` + `__init__` 加 `roi_ref_reencode/ref_crop_size`。
+- 新增 `_ref_hr_pos_ids`:把 gh×gw 高清网格映射到 target(lq)脸框坐标(stream T=20)。
+- `__call__`:从 `data[7]` 取 `ref_hr_latents`;每个 `pack_latents` → 拼到 `latent_model_input` 尾部、ids 拼到 `latent_image_ids`、记录每 ID 的 `ref_hr=(start,end)`(image-local)写进 `id_patch_pairs[k]`。
+
+## A-3. `Dit_pipeline.dit_infer`（2 处 patch，改你当前文件）
+
+**(a) 匹配块之后、`# ===== 以下所有代码保持原样不变 =====` 之前,插入 ref 脸重编码：**
+```python
+        # ========== Version A: 高清 ref 脸重编码 ==========
+        ref_hr_latents = None
+        if (self.use_id_patch_attention and ref is not None and no_split
+                and self.cfg.get('id_patch_roi_ref_reencode', False)
+                and id_patch_pairs and id_patch_pairs_pixel):
+            import torch.nn.functional as F
+            S = int(self.cfg.get('id_patch_ref_crop_size', 512)); S = max(16, (S // 16) * 16)
+            mf = self.cfg.get('id_patch_roi_max_faces', -1)
+            pairs_px = id_patch_pairs_pixel if (mf is None or int(mf) < 0) else id_patch_pairs_pixel[:int(mf)]
+            er = float(self.cfg.get('id_patch_expand_ratio_ref', 1.0))
+            ref_dev = ref.to(self.device).to(self.dtype)
+            _, _, Hpx, Wpx = ref_dev.shape
+            ref_hr_latents = []
+            for pp in pairs_px:
+                x1, y1, x2, y2 = pp['ref']
+                cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                bw, bh = (x2 - x1) * er, (y2 - y1) * er
+                ex1 = max(0, int(cx - bw / 2)); ey1 = max(0, int(cy - bh / 2))
+                ex2 = min(Wpx, int(cx + bw / 2)); ey2 = min(Hpx, int(cy + bh / 2))
+                if ex2 - ex1 < 2 or ey2 - ey1 < 2:
+                    ref_hr_latents.append(None); continue
+                crop = ref_dev[:, :, ey1:ey2, ex1:ex2].float()
+                crop = F.interpolate(crop, size=(S, S), mode='bicubic', align_corners=False).clamp(-1, 1).to(self.dtype)
+                ref_hr_latents.append(KleinVAEProcessor.encode(self.vae, crop))   # [1,128,S//16,S//16]
+            if self.rank == 0:
+                print(f"---Version A: re-encoded {sum(l is not None for l in ref_hr_latents)} ref crop(s) @ {S}px")
+```
+
+**(b) no_split 的 transformer 调用处,把 ref_hr 一起传入：**
+```python
+                if id_patch_pairs is not None:
+                    input_data.append(id_patch_pairs)
+                    if ref_hr_latents is not None:      # ← 新增
+                        input_data.append(ref_hr_latents)
+```
+
+## 新增 cfg（yaml `Dit:`）
+```yaml
+  id_patch_roi_ref_reencode: true   # 开 Version A
+  id_patch_ref_crop_size: 512       # ref 脸 crop resize 到的边长(/16);扫 512/1024
+  id_patch_roi_max_faces: 1         # 先单脸验证
+  id_patch_noise_alpha: 0.6         # 注入强度
+  id_patch_expand_ratio_ref: 1.5    # ref 像素 crop 外扩(取多少周边)
+  id_patch_expand_ratio_lq: 1.5     # 局部 lq 结构范围
+  # 关掉插值类 ROI / persist：
+  id_patch_roi_mode: false
+  id_patch_roi_persist: false
 ```
