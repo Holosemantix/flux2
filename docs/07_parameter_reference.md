@@ -31,6 +31,7 @@
 | `id_patch_roi_size` | int | 24 | **P**:虚拟 ROI 边长(token),attention 时的密度 |
 | `id_patch_roi_pe_mode` | str | "pe2" | 虚拟 token 位置编码:`pe1`/`pe2`/`pe3` |
 | `id_patch_roi_include_lq` | bool | true | 虚拟 KV 是否含 lq 结构 ROI(`[lq+ref]` vs 仅 `ref`) |
+| `id_patch_roi_max_faces` | int | -1 | 仅处理前 N 张匹配脸(-1=全部);P=64 等大开销诊断设 1~2 |
 | `id_patch_roi_persist` | bool | false | 跨层保持高分辨率(**已实现**:全程保持+循环末降采样回写) |
 | `id_patch_roi_up_layer` | int | -1 | persist 起始层(预留,当前版恒为"循环前") |
 | `id_patch_roi_down_layer` | int | -1 | persist 下采回写层(预留,当前版恒为"循环末") |

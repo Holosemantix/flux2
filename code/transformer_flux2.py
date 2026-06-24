@@ -74,7 +74,8 @@ class IdPatchConfig:
     roi_size: int = 24            # P，虚拟 ROI 边长（token）
     roi_pe_mode: str = "pe2"      # 虚拟 token 位置编码：'pe1'连续/'pe2'压回原框/'pe3'映射到target脸
     roi_include_lq: bool = True   # KV 是否包含 lq 结构 ROI（[lq + ref] vs 仅 ref）
-    # B-1.5 persist（跨层保持高分辨率）：需要 forward 改造，暂未接通，置 True 会告警并回退 per-layer
+    roi_max_faces: int = -1       # 仅处理前 N 个匹配脸（-1=全部）；P=64 等大开销诊断时设 1~2
+    # B-1.5 persist（跨层保持高分辨率）
     roi_persist: bool = False
     roi_up_layer: int = -1
     roi_down_layer: int = -1
@@ -1569,6 +1570,14 @@ class Flux2Transformer2DModel(
             torch.cat([text_rotary_emb[0], image_rotary_emb[0]], dim=0),
             torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
         )
+
+        # ============ 限制处理的人脸数（P=64 等大开销诊断用）============
+        if id_patch_config is not None and id_patch_pairs:
+            _mf = getattr(id_patch_config, "roi_max_faces", -1)
+            if _mf is not None and _mf >= 0 and len(id_patch_pairs) > _mf:
+                if _ROI_DEBUG:
+                    print(f"[roi] roi_max_faces={_mf}: 用前 {_mf}/{len(id_patch_pairs)} 张脸", flush=True)
+                id_patch_pairs = id_patch_pairs[:_mf]
 
         # ============ Version B-1.5 persist：循环前在 image 尾部追加高密度脸影子 token ============
         persist_state = None

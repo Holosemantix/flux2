@@ -67,7 +67,8 @@ class IdPatchConfig:
     roi_size: int = 24
     roi_pe_mode: str = "pe2"
     roi_include_lq: bool = True
-    roi_persist: bool = False        # 暂未接通（需 forward 改造），置 True 告警并回退 per-layer
+    roi_max_faces: int = -1          # 仅处理前 N 张匹配脸（-1=全部）；大开销诊断(P=64)设 1~2
+    roi_persist: bool = False
     roi_up_layer: int = -1
     roi_down_layer: int = -1
 
@@ -157,6 +158,7 @@ class RefinerModel(object):
                 roi_size=kwargs.get('id_patch_roi_size', 24),
                 roi_pe_mode=kwargs.get('id_patch_roi_pe_mode', 'pe2'),
                 roi_include_lq=kwargs.get('id_patch_roi_include_lq', True),
+                roi_max_faces=kwargs.get('id_patch_roi_max_faces', -1),
                 roi_persist=kwargs.get('id_patch_roi_persist', False),
                 roi_up_layer=kwargs.get('id_patch_roi_up_layer', -1),
                 roi_down_layer=kwargs.get('id_patch_roi_down_layer', -1),
