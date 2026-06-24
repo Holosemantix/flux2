@@ -21,6 +21,8 @@ code/
   transformer_flux2.py        # 改好的整份（含 Version A/A'/B，合入前请 diff）
   refine_model.py             # 改好的整份（含 Version A/A'/B）
   Dit_pipeline.py             # 改好的整份（含尾逗号 bug 修复 + Version A 的 ref 重编码）
+tools/
+  apply_roi_qsupersample_patch.py # ★ 下一步 B-2：Q-only supersampling ROI attention 的可重复补丁脚本
 docs/
   01_background_and_mechanism.md   # 现有机制 + 坐标系确认 + 关键认知校正
   02_version_a_design.md           # Version A 设计 + 正确性核对步骤
@@ -32,6 +34,7 @@ docs/
   08_version_b_plan.md             # ★ Version B(提分辨率/细节容量) 实验计划
   09_findings_B_and_pe.md          # ★ B 实测:per-layer 无效/persist 模糊/PE 已排除/单趟下采上限
   10_bugfix_and_versionA_plan.md   # ★ Dit_pipeline 尾逗号 bug + 当前结论 + Version A 实现计划
+  11_q_supersample_next_experiment_and_innovation.md # ★ 不 crop-ref-concat 的下一步：Q-only supersampling + 创新性分析
 ```
 
 > `Dit_pipeline.py` 文件大、改动仅 3 行，未整份重放——补丁见 `CHANGES_version_a.md` 第 3 节。
@@ -47,6 +50,10 @@ docs/
 2. 按 `CHANGES_version_a.md` 合入，跑 `docs/02` 的「坐标系核对 + baseline 对齐验证」。
 3. 按 `docs/03` 的实验矩阵跑 B0 / B1 / K2 / K3 / K4。
 4. 按 `docs/04` 的指标和决策树分析。
+5. 如果要继续“不通过 crop ref concat / ref 重编码”的路线，读 `docs/11`，运行：
+   ```bash
+   python tools/apply_roi_qsupersample_patch.py
+   ```
 
 ## 核心假设 & 成功判据
 
@@ -61,5 +68,6 @@ docs/
 - **Version B（Virtual ROI-QKV · 单趟 · attention 内提分辨率 · 无 crop/无后处理）**：**已实现(per-layer)**。attention 里把人脸 ROI 用 ROIAlign 升到 P×P 虚拟 token、高密度 attend、降采样回 native、残差注入 noise 段;虚拟 token 重配 RoPE(pe1/pe2/pe3)。开关 `id_patch_roi_mode`。参数/phase 见 `docs/08`,改动见 `CHANGES` Version B 节。**首跑开 `ROI_DEBUG=1`**。
 - **persist(跨层保持高分辨率,B-1.5)**：已实现但**实测变糊**(插值上采→下采两次低通 + 重复 token OOD)。结论:插值类 ROI 是死路。
 - **Version A（真·高清 ref 重编码）**：**已实现**(`id_patch_roi_ref_reencode=true`)。把 ref 脸像素 crop 重编码成真·高清 token 拼进序列;noise 脸 query(native,不上采→不糊)attend `[局部 lq + 高清 ref]`,残差注入。**这是单趟内唯一能加真细节、且不糊的路**(输出仍 native 尺寸,上限 ~128px crisp)。设计/参数见 `docs/10` + CHANGES Version A 段。
+- **Version B-2（Q-only supersampling）**：**已新增补丁脚本 + 实验文档**。不插值 V、不生成/下采样 P×P latent，只把 native noise face query 复制成 m×m 个子查询，用子 token RoPE 去 attend native lq/ref K/V，再聚合回原 native token。用于验证“不 crop-ref-concat、不重编码 ref”的 attention 内匹配分辨率路线，见 `docs/11`。
 - **🔴 务必先修** Dit_pipeline `load_modules` 的尾逗号 bug(见 CHANGES Bugfix),否则 roi_pe_mode/开关都不对。
 - **多 ID 泄漏 mitigation**：已登记后续点(每脸独立 ROI 天然隔离)。
