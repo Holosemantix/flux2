@@ -43,3 +43,5 @@ jobs:
           git add code/transformer_flux2.py code/refine_model.py code/Dit_pipeline.py tmp_should_not_create.md docs/.keep
           git commit -m "Apply ROI q-supersample code patch"
           git push
+
+# retrigger: 2026-06-25
