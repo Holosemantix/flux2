@@ -71,6 +71,12 @@ class IdPatchConfig:
     roi_persist: bool = False
     roi_up_layer: int = -1
     roi_down_layer: int = -1
+    # ===== Version B-2（Q-only supersampling）=====
+    roi_variant: str = "interpolate"
+    roi_subsample: int = 2
+    roi_agg_mode: str = "mean"
+    roi_split_branches: bool = True
+    roi_detail_beta: float = 0.5
     # ===== Version A（真·高清 ref 重编码）=====
     roi_ref_reencode: bool = False
     ref_crop_size: int = 512
@@ -165,6 +171,11 @@ class RefinerModel(object):
                 roi_persist=kwargs.get('id_patch_roi_persist', False),
                 roi_up_layer=kwargs.get('id_patch_roi_up_layer', -1),
                 roi_down_layer=kwargs.get('id_patch_roi_down_layer', -1),
+                roi_variant=kwargs.get('id_patch_roi_variant', 'interpolate'),
+                roi_subsample=kwargs.get('id_patch_roi_subsample', 2),
+                roi_agg_mode=kwargs.get('id_patch_roi_agg_mode', 'mean'),
+                roi_split_branches=kwargs.get('id_patch_roi_split_branches', True),
+                roi_detail_beta=kwargs.get('id_patch_roi_detail_beta', 0.5),
                 roi_ref_reencode=kwargs.get('id_patch_roi_ref_reencode', False),
                 ref_crop_size=kwargs.get('id_patch_ref_crop_size', 512),
             )
@@ -184,8 +195,9 @@ class RefinerModel(object):
         """[Version A] 把 gh×gw 的高清 ref token 网格映射到 target(lq)脸框坐标，stream T=t_val。
         返回 [gh*gw, 4] 的 (T,H,W,L) 连续坐标 id。"""
         y1, x1, y2, x2 = tbox
-        ys = torch.linspace(float(y1), float(y2), gh)
-        xs = torch.linspace(float(x1), float(x2), gw)
+        # bbox 是半开区间 [y1,y2) / [x1,x2)，用 token-center 坐标避免 RoPE 端点拉伸
+        ys = torch.linspace(float(y1) + 0.5, float(y2) - 0.5, gh)
+        xs = torch.linspace(float(x1) + 0.5, float(x2) - 0.5, gw)
         gy, gx = torch.meshgrid(ys, xs, indexing="ij")
         gy = gy.reshape(-1)
         gx = gx.reshape(-1)

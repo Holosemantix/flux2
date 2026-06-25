@@ -79,6 +79,12 @@ class IdPatchConfig:
     roi_persist: bool = False
     roi_up_layer: int = -1
     roi_down_layer: int = -1
+    # ===== Version B-2（Q-only supersampling，不插值 V、不下采样虚拟 latent）=====
+    roi_variant: str = "interpolate"  # 'interpolate'=旧 B; 'q_supersample'=下一步实验
+    roi_subsample: int = 2              # 每个 native noise face token 生成 m×m 个子查询
+    roi_agg_mode: str = "mean"        # 子查询输出聚合：mean / center
+    roi_split_branches: bool = True     # lq/ref 分支分开 softmax，避免互相稀释
+    roi_detail_beta: float = 0.5        # split 分支下 ref detail 分支权重，0=纯 lq, 1=纯 ref
     # ===== Version A（真·高清 ref 重编码）=====
     # noise 脸 query(native,不上采)attend 序列里的高清 ref_hr token(真高频),残差注入。
     roi_ref_reencode: bool = False
@@ -526,8 +532,8 @@ def _make_roi_pos_ids(
     返回 [P*P, 4]（float）。
     """
     y1, x1, y2, x2 = sample_box
-    ys = torch.linspace(float(y1), float(y2), P, device=device)
-    xs = torch.linspace(float(x1), float(x2), P, device=device)
+    ys = torch.linspace(float(y1) + 0.5, float(y2) - 0.5, P, device=device)
+    xs = torch.linspace(float(x1) + 0.5, float(x2) - 0.5, P, device=device)
     gy, gx = torch.meshgrid(ys, xs, indexing="ij")
     gy = gy.reshape(-1)
     gx = gx.reshape(-1)
@@ -653,6 +659,184 @@ def _virtual_roi_qkv_attention(
     return output
 
 
+
+def _make_rect_pos_ids(
+    sample_box: Tuple[int, int, int, int],
+    orig_box: Tuple[int, int, int, int],
+    t_val: int,
+    mode: str,
+    target_box: Optional[Tuple[int, int, int, int]] = None,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Native rectangular token ids using token-center coordinates.
+
+    This is the native-token counterpart of _make_roi_pos_ids. It does not
+    interpolate token contents; it only assigns RoPE ids to already existing
+    K tokens. For ref with mode='pe3', the ref rectangle is mapped into the
+    target lq face coordinate frame.
+    """
+    y1, x1, y2, x2 = sample_box
+    h = max(int(y2 - y1), 1)
+    w = max(int(x2 - x1), 1)
+    ys = torch.linspace(float(y1) + 0.5, float(y2) - 0.5, h, device=device)
+    xs = torch.linspace(float(x1) + 0.5, float(x2) - 0.5, w, device=device)
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+    gy = gy.reshape(-1)
+    gx = gx.reshape(-1)
+
+    if mode == "pe2":
+        oy1, ox1, oy2, ox2 = orig_box
+        cy = (oy1 + oy2) / 2.0
+        cx = (ox1 + ox2) / 2.0
+        ry = max(y2 - y1, 1e-6) / max(oy2 - oy1, 1e-6)
+        rx = max(x2 - x1, 1e-6) / max(ox2 - ox1, 1e-6)
+        gy = cy + (gy - cy) / ry
+        gx = cx + (gx - cx) / rx
+    elif mode == "pe3" and target_box is not None:
+        ty1, tx1, ty2, tx2 = target_box
+        ny = (gy - (float(y1) + 0.5)) / max(y2 - y1, 1e-6)
+        nx = (gx - (float(x1) + 0.5)) / max(x2 - x1, 1e-6)
+        gy = ty1 + 0.5 + ny * max(ty2 - ty1, 1e-6)
+        gx = tx1 + 0.5 + nx * max(tx2 - tx1, 1e-6)
+
+    t = torch.full_like(gy, float(t_val))
+    l = torch.zeros_like(gy)
+    return torch.stack([t, gy, gx, l], dim=-1)
+
+
+def _make_subquery_pos_ids(
+    box: Tuple[int, int, int, int],
+    m: int,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Generate m×m sub-query positions around each native token center.
+
+    The content vector is not interpolated; each native q is repeated m² times.
+    Only the RoPE position is offset inside the native token cell. This avoids
+    the low-pass failure of interpolating latent V and downsampling it back.
+    """
+    y1, x1, y2, x2 = box
+    ys = torch.arange(y1, y2, device=device, dtype=torch.float32)
+    xs = torch.arange(x1, x2, device=device, dtype=torch.float32)
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+    base_y = gy.reshape(-1)
+    base_x = gx.reshape(-1)
+
+    offsets = (torch.arange(m, device=device, dtype=torch.float32) + 0.5) / float(m) - 0.5
+    oy, ox = torch.meshgrid(offsets, offsets, indexing="ij")
+    oy = oy.reshape(-1)
+    ox = ox.reshape(-1)
+
+    sub_y = base_y[:, None] + oy[None, :]
+    sub_x = base_x[:, None] + ox[None, :]
+    sub_y = sub_y.reshape(-1)
+    sub_x = sub_x.reshape(-1)
+    t = torch.full_like(sub_y, float(_ROI_T_NOISE))
+    l = torch.zeros_like(sub_y)
+    return torch.stack([t, sub_y, sub_x, l], dim=-1)
+
+
+def _aggregate_subquery_outputs(x: torch.Tensor, n_native: int, m: int, mode: str) -> torch.Tensor:
+    """[B, n_native*m*m, H, D] -> [B, n_native, H, D]."""
+    B, _, Hh, D = x.shape
+    x = x.reshape(B, n_native, m * m, Hh, D)
+    if mode == "center":
+        return x[:, :, (m * m) // 2]
+    return x.mean(dim=2)
+
+
+def _q_supersample_roi_attention(
+    output: torch.Tensor,
+    q_pre: torch.Tensor, k_pre: torch.Tensor, v_pre: torch.Tensor,
+    ranges: Dict[str, Tuple[int, int]],
+    id_patch_pairs: List[Dict[str, Tuple[int, int, int, int]]],
+    latent_h: int, latent_w: int,
+    m: int, pe_mode: str, include_lq: bool, agg_mode: str,
+    split_branches: bool, detail_beta: float, noise_alpha: float,
+    exp_lq: float, exp_ref: float, exp_min: int,
+    rope_theta: int, axes_dim,
+    backend=None, parallel_config=None,
+) -> torch.Tensor:
+    """Version B-2: Q-only supersampling.
+
+    Difference from previous Virtual ROI-QKV:
+      * does NOT bilinear-upsample latent V;
+      * does NOT create P×P virtual latent outputs and downsample them;
+      * repeats each native noise-face query m² times with sub-token RoPE ids;
+      * lets these sub-queries attend to native lq/ref K/V;
+      * aggregates only attention outputs back to the original native token.
+
+    This tests whether attention-logit/query resolution alone can improve ID
+    detail transfer without the low-pass artifact of interpolation-based ROI.
+    """
+    m = max(1, _as_int(m))
+    B, S, Hh, D = q_pre.shape
+    noise_start, noise_end = ranges["noise"]
+    lq_start, lq_end = ranges["lq"]
+    ref_start, ref_end = ranges["ref"]
+    if not id_patch_pairs or noise_end <= noise_start or ref_end <= ref_start:
+        return output
+    dev = q_pre.device
+    detail_beta = float(detail_beta)
+
+    for pair in id_patch_pairs:
+        lq_bbox = pair["lq"]
+        ref_bbox = pair["ref"]
+        ly1, lx1, ly2, lx2 = lq_bbox
+        h_f, w_f = ly2 - ly1, lx2 - lx1
+        if h_f <= 0 or w_f <= 0:
+            continue
+
+        nq_idx = _build_2d_rect_indices(ly1, lx1, ly2, lx2, latent_w, dev) + noise_start
+        n_native = int(nq_idx.numel())
+        q_native = q_pre[:, nq_idx]
+        q_sub = q_native[:, :, None].expand(B, n_native, m * m, Hh, D).reshape(B, n_native * m * m, Hh, D)
+        q_ids = _make_subquery_pos_ids(lq_bbox, m, device=dev)
+        qc, qs = _virtual_rope_freqs(q_ids, rope_theta, axes_dim)
+        q_sub = apply_rotary_emb(q_sub, (qc, qs), sequence_dim=1)
+
+        ref_exp = _expand_bbox(ref_bbox, exp_ref, exp_min, latent_h, latent_w)
+        ry1, rx1, ry2, rx2 = ref_exp
+        rk_idx = _build_2d_rect_indices(ry1, rx1, ry2, rx2, latent_w, dev) + ref_start
+        k_ref = k_pre[:, rk_idx]
+        v_ref = v_pre[:, rk_idx]
+        ref_ids = _make_rect_pos_ids(ref_exp, ref_bbox, _ROI_T_REF, pe_mode, target_box=lq_bbox, device=dev)
+        rc, rs = _virtual_rope_freqs(ref_ids, rope_theta, axes_dim)
+        k_ref = apply_rotary_emb(k_ref, (rc, rs), sequence_dim=1)
+
+        if include_lq and lq_end > lq_start:
+            lq_exp = _expand_bbox(lq_bbox, exp_lq, exp_min, latent_h, latent_w)
+            ey1, ex1, ey2, ex2 = lq_exp
+            lk_idx = _build_2d_rect_indices(ey1, ex1, ey2, ex2, latent_w, dev) + lq_start
+            k_lq = k_pre[:, lk_idx]
+            v_lq = v_pre[:, lk_idx]
+            lq_ids = _make_rect_pos_ids(lq_exp, lq_bbox, _ROI_T_LQ, pe_mode, target_box=lq_bbox, device=dev)
+            lc, ls = _virtual_rope_freqs(lq_ids, rope_theta, axes_dim)
+            k_lq = apply_rotary_emb(k_lq, (lc, ls), sequence_dim=1)
+
+            if split_branches:
+                out_lq = _dispatch_attention(q_sub, k_lq, v_lq, num_heads=Hh,
+                                             backend=backend, parallel_config=parallel_config)
+                out_ref = _dispatch_attention(q_sub, k_ref, v_ref, num_heads=Hh,
+                                              backend=backend, parallel_config=parallel_config)
+                sub_out = (1.0 - detail_beta) * out_lq + detail_beta * out_ref
+            else:
+                sub_out = _dispatch_attention(
+                    q_sub, torch.cat([k_lq, k_ref], dim=1), torch.cat([v_lq, v_ref], dim=1),
+                    num_heads=Hh, backend=backend, parallel_config=parallel_config,
+                )
+        else:
+            sub_out = _dispatch_attention(q_sub, k_ref, v_ref, num_heads=Hh,
+                                          backend=backend, parallel_config=parallel_config)
+
+        native_out = _aggregate_subquery_outputs(sub_out, n_native, m, agg_mode)
+        if _ROI_DEBUG:
+            print(f"[roi-qsub] m={m} agg={agg_mode} split={split_branches} beta={detail_beta:.2f} "
+                  f"noise={h_f}x{w_f}tok q_sub={tuple(q_sub.shape)} ref_k={k_ref.shape[1]}", flush=True)
+        output[:, nq_idx] = (1.0 - noise_alpha) * output[:, nq_idx] + noise_alpha * native_out
+
+    return output
+
 def _maybe_virtual_roi(
     output, q_pre, k_pre, v_pre, ranges, id_patch_pairs, latent_h, latent_w,
     id_patch_config, rope_theta, rope_axes_dim, backend, parallel_config,
@@ -662,6 +846,25 @@ def _maybe_virtual_roi(
     if rope_theta is None or rope_axes_dim is None:
         logger.warning("roi_mode 需要 rope_theta/rope_axes_dim，但未传入，跳过 Version B。")
         return output
+
+    roi_variant = getattr(id_patch_config, "roi_variant", "interpolate")
+    if roi_variant == "q_supersample":
+        return _q_supersample_roi_attention(
+            output, q_pre, k_pre, v_pre, ranges, id_patch_pairs, latent_h, latent_w,
+            m=getattr(id_patch_config, "roi_subsample", 2),
+            pe_mode=getattr(id_patch_config, "roi_pe_mode", "pe3"),
+            include_lq=getattr(id_patch_config, "roi_include_lq", True),
+            agg_mode=getattr(id_patch_config, "roi_agg_mode", "mean"),
+            split_branches=getattr(id_patch_config, "roi_split_branches", True),
+            detail_beta=getattr(id_patch_config, "roi_detail_beta", 0.5),
+            noise_alpha=getattr(id_patch_config, "noise_alpha", 0.5),
+            exp_lq=getattr(id_patch_config, "expand_ratio_lq", 1.0),
+            exp_ref=getattr(id_patch_config, "expand_ratio_ref", 1.0),
+            exp_min=getattr(id_patch_config, "expand_min_size", 0),
+            rope_theta=rope_theta, axes_dim=rope_axes_dim,
+            backend=backend, parallel_config=parallel_config,
+        )
+
     return _virtual_roi_qkv_attention(
         output, q_pre, k_pre, v_pre, ranges, id_patch_pairs, latent_h, latent_w,
         P=getattr(id_patch_config, "roi_size", 24),

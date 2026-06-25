@@ -139,6 +139,12 @@ class DitPipe:
             dit_params['id_patch_roi_max_faces'] = self.cfg.get('id_patch_roi_max_faces', -1)
             dit_params['id_patch_roi_up_layer'] = self.cfg.get('id_patch_roi_up_layer', -1)
             dit_params['id_patch_roi_down_layer'] = self.cfg.get('id_patch_roi_down_layer', -1)
+            # ===== Version B-2（Q-only supersampling）=====
+            dit_params['id_patch_roi_variant'] = self.cfg.get('id_patch_roi_variant', 'interpolate')
+            dit_params['id_patch_roi_subsample'] = self.cfg.get('id_patch_roi_subsample', 2)
+            dit_params['id_patch_roi_agg_mode'] = self.cfg.get('id_patch_roi_agg_mode', 'mean')
+            dit_params['id_patch_roi_split_branches'] = self.cfg.get('id_patch_roi_split_branches', True)
+            dit_params['id_patch_roi_detail_beta'] = self.cfg.get('id_patch_roi_detail_beta', 0.5)
 
             # ===== Version A（真·高清 ref 重编码）=====
             dit_params['id_patch_roi_ref_reencode'] = self.cfg.get('id_patch_roi_ref_reencode', False)
