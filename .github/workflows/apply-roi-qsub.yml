@@ -1,0 +1,45 @@
+name: Apply ROI q-supersample patch
+
+on:
+  push:
+    branches:
+      - id-roi-attention-version-a
+    paths:
+      - tools/apply_roi_qsupersample_patch.py
+      - .github/workflows/apply-roi-qsub.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: id-roi-attention-version-a
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply q-supersample patch to code files
+        run: |
+          python tools/apply_roi_qsupersample_patch.py
+          python -m py_compile code/transformer_flux2.py code/refine_model.py code/Dit_pipeline.py
+
+      - name: Remove accidental temporary files if present
+        run: |
+          rm -f tmp_should_not_create.md docs/.keep
+
+      - name: Commit patched code
+        run: |
+          if git diff --quiet; then
+            echo "No code changes produced by patch script."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add code/transformer_flux2.py code/refine_model.py code/Dit_pipeline.py tmp_should_not_create.md docs/.keep
+          git commit -m "Apply ROI q-supersample code patch"
+          git push
