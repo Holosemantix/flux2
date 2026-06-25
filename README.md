@@ -2,15 +2,19 @@
 
 FLUX.2 多参考 refiner / 合影超分场景下的 **training-free 实验**：验证「扩大同 ID 局部 attention 的 ROI、再写回原 bbox」能否在不训练的情况下提升同 ID 细节恢复质量。
 
-本仓库含 **Version A（Expanded-KV Only）** 与 **Version A'（Noise-Fixup）** 的代码改动 + 实验文档 + 实测发现。不训练、不改权重，只在推理时改 attention。
+本仓库含 **Version A（Expanded-KV Only）**、**A'（Noise-Fixup）**、**B（Virtual ROI-QKV）**、**B-2（Q-only supersampling）** 的代码改动 + 实验文档 + 实测发现。不训练、不改权重，只在推理时改 attention。
 
-> **当前结论(读 `docs/05`)**:Version A 在 wide 合影小脸上对输出脸**几乎无可见作用**,且效果埋在 NPU run-to-run 数值噪声(maxdiff~34)之下。已实现 **A'**(直接 steer 输出 noise 段,`[局部lq结构 + 扩大ref细节]` 残差注入)作为下一步,实验顺序见 `docs/06`。
+> **当前结论**：Version A 在 wide 合影小脸上对输出脸几乎无可见作用，A' 证明直接 steer 输出 noise 段会产生响应但不提升清晰度，B 证明插值式 ROI token upscale 会变糊。当前下一步主线是 **B-2 Q-only sub-token RoPE probing + canonical ROI alignment**，并把研究问题提升为「如何把结构化先验更好注入扩散模型以修复/提升生成结果」。
 
 ## 这是什么
 
 现有 pipeline 已经在特定层做「同 ID bbox cross-attention」：lq 的人脸区域只 attend 匹配到的那个 ref bbox。**Version A 的唯一改动**：做这步时把被 attend 的一侧 bbox 从 `B_i` 扩大到 `E_i`（用已 apply RoPE 的现有 token，零 PE 风险），attention 输出仍只写回原始 `B_i`。
 
-主旋钮是 **`expand_ratio_ref`**（lq 对 ref 的可见范围）——见 `docs/01` 对「为什么是它」的推导。
+后续实验把问题拆成更一般的 prior injection：
+
+- crop 之所以好，可能同时来自 token density、canonical alignment、local dominance、完整 denoising trajectory 和真高频源；
+- B-2 不再插值 value / latent，而是只复制 native noise query，用不同子 token RoPE 位置去 query native lq/ref memory；
+- 这条线可以被定位为 **attention-space prior injection / diffusion repair**，而不是单纯的小脸 ROI trick。
 
 ## 目录
 
@@ -18,11 +22,11 @@ FLUX.2 多参考 refiner / 合影超分场景下的 **training-free 实验**：�
 README.md
 CHANGES_version_a.md          # ★ 精确改动清单（Version A + A'），合入真实仓按这个
 code/
-  transformer_flux2.py        # 改好的整份（含 Version A/A'/B，合入前请 diff）
-  refine_model.py             # 改好的整份（含 Version A/A'/B）
-  Dit_pipeline.py             # 改好的整份（含尾逗号 bug 修复 + Version A 的 ref 重编码）
+  transformer_flux2.py        # 改好的整份（含 Version A/A'/B/B-2，合入前请 diff）
+  refine_model.py             # 改好的整份（含 Version A/A'/B/B-2）
+  Dit_pipeline.py             # 改好的整份（含尾逗号 bug 修复 + Version A/B-2 参数透传）
 tools/
-  apply_roi_qsupersample_patch.py # ★ 下一步 B-2：Q-only supersampling ROI attention 的可重复补丁脚本
+  apply_roi_qsupersample_patch.py # ★ B-2：Q-only supersampling ROI attention 的可重复补丁脚本
 docs/
   01_background_and_mechanism.md   # 现有机制 + 坐标系确认 + 关键认知校正
   02_version_a_design.md           # Version A 设计 + 正确性核对步骤
@@ -34,15 +38,19 @@ docs/
   08_version_b_plan.md             # ★ Version B(提分辨率/细节容量) 实验计划
   09_findings_B_and_pe.md          # ★ B 实测:per-layer 无效/persist 模糊/PE 已排除/单趟下采上限
   10_bugfix_and_versionA_plan.md   # ★ Dit_pipeline 尾逗号 bug + 当前结论 + Version A 实现计划
-  11_q_supersample_next_experiment_and_innovation.md # ★ 不 crop-ref-concat 的下一步：Q-only supersampling + 创新性分析
+  11_q_supersample_next_experiment_and_innovation.md # ★ B-2：Q-only supersampling + 创新性分析
+  12_t_noise_and_adaptive_fusion.md # ★ T_noise/stream id 解释 + adaptive beta 设计
+  13_crop_gain_decomposition_and_alignment.md # ★ crop 收益拆解：density vs alignment
+  14_novelty_survey_and_positioning.md # ★ 与 RALU/CRPA/MasaCtrl/ID adapter 等比较
+  15_prior_injection_novelty_and_high_level_positioning.md # ★ 高层定位：attention-space prior injection / diffusion repair
 ```
 
-> `Dit_pipeline.py` 文件大、改动仅 3 行，未整份重放——补丁见 `CHANGES_version_a.md` 第 3 节。
-> `code/` 里的整份文件是基于贴出的片段重建的，**合入真实仓前务必 diff**，确认改动只发生在 `CHANGES` 列出的位置。
+> `Dit_pipeline.py` 文件大、改动仅少量参数透传，合入真实仓前仍建议 diff。
+> `code/` 里的整份文件是基于当前分支实验重建的，**合入真实仓前务必 diff**，确认改动只发生在 `CHANGES` / docs 列出的位置。
 
 ## 安全性
 
-所有改动在默认参数 `(expand_ratio_*=1.0, expand_min_size=0)` 下与现有实现**逐 bit 等价**，可安全合入；只有显式设置 expand 参数才会改变行为。
+所有改动在默认参数 `(expand_ratio_*=1.0, expand_min_size=0, roi_mode=false)` 下应与现有实现等价；只有显式设置 expand / fixup / ROI 参数才会改变行为。
 
 ## 快速上手
 
@@ -50,10 +58,8 @@ docs/
 2. 按 `CHANGES_version_a.md` 合入，跑 `docs/02` 的「坐标系核对 + baseline 对齐验证」。
 3. 按 `docs/03` 的实验矩阵跑 B0 / B1 / K2 / K3 / K4。
 4. 按 `docs/04` 的指标和决策树分析。
-5. 如果要继续“不通过 crop ref concat / ref 重编码”的路线，读 `docs/11`，运行：
-   ```bash
-   python tools/apply_roi_qsupersample_patch.py
-   ```
+5. 如果要继续“不通过 crop ref concat / ref 重编码”的路线，读 `docs/11`、`docs/12`、`docs/13`。
+6. 如果要写成更高层方法，读 `docs/14` 和 `docs/15`。
 
 ## 核心假设 & 成功判据
 
@@ -68,6 +74,7 @@ docs/
 - **Version B（Virtual ROI-QKV · 单趟 · attention 内提分辨率 · 无 crop/无后处理）**：**已实现(per-layer)**。attention 里把人脸 ROI 用 ROIAlign 升到 P×P 虚拟 token、高密度 attend、降采样回 native、残差注入 noise 段;虚拟 token 重配 RoPE(pe1/pe2/pe3)。开关 `id_patch_roi_mode`。参数/phase 见 `docs/08`,改动见 `CHANGES` Version B 节。**首跑开 `ROI_DEBUG=1`**。
 - **persist(跨层保持高分辨率,B-1.5)**：已实现但**实测变糊**(插值上采→下采两次低通 + 重复 token OOD)。结论:插值类 ROI 是死路。
 - **Version A（真·高清 ref 重编码）**：**已实现**(`id_patch_roi_ref_reencode=true`)。把 ref 脸像素 crop 重编码成真·高清 token 拼进序列;noise 脸 query(native,不上采→不糊)attend `[局部 lq + 高清 ref]`,残差注入。**这是单趟内唯一能加真细节、且不糊的路**(输出仍 native 尺寸,上限 ~128px crisp)。设计/参数见 `docs/10` + CHANGES Version A 段。
-- **Version B-2（Q-only supersampling）**：**已新增补丁脚本 + 实验文档**。不插值 V、不生成/下采样 P×P latent，只把 native noise face query 复制成 m×m 个子查询，用子 token RoPE 去 attend native lq/ref K/V，再聚合回原 native token。用于验证“不 crop-ref-concat、不重编码 ref”的 attention 内匹配分辨率路线，见 `docs/11`。
+- **Version B-2（Q-only supersampling）**：**已落到 code/**。不插值 V、不生成/下采样 P×P latent，只把 native noise face query 复制成 m×m 个子查询，用子 token RoPE 去 attend native lq/ref K/V，再聚合回原 native token。用于验证“不 crop-ref-concat、不重编码 ref”的 attention 内匹配分辨率路线，见 `docs/11`。
+- **Prior injection high-level framing**：已新增 `docs/15`。把当前路线提升为 **attention-space prior injection / diffusion repair**：如何把 bbox、reference、lq structure、canonical alignment、confidence 等先验注入扩散模型内部，从而修复生成结果。
 - **🔴 务必先修** Dit_pipeline `load_modules` 的尾逗号 bug(见 CHANGES Bugfix),否则 roi_pe_mode/开关都不对。
 - **多 ID 泄漏 mitigation**：已登记后续点(每脸独立 ROI 天然隔离)。
