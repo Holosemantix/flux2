@@ -60,6 +60,22 @@ python scripts/flux2_klein_diffusers.py \
   --output flux-klein-multiref.png
 ```
 
+## Training-free attention mass probe
+
+For the first reference-token-density diagnostic, use:
+
+```sh
+python scripts/training_free/flux2_attention_mass_probe.py \
+  --prompt "Change the scene but preserve the important details from the reference." \
+  --image ref.png \
+  --image-label global \
+  --output-dir outputs/probe_baseline
+```
+
+The probe can add HR crop references with `--crop INDEX:LABEL:X0,Y0,X1,Y1`, record grouped attention mass, simulate group-size balancing, and optionally apply group-size balancing to the real attention call.
+
+See [docs/training_free_attention_mass_probe.md](training_free_attention_mass_probe.md) for the step-by-step baseline, reference-pyramid, simulated-balancing, and actual-balancing experiments.
+
 ## Useful flags
 
 - `--model`: change the Hugging Face model id, for example to a 9B or base checkpoint.
