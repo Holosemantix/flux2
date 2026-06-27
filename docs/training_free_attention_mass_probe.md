@@ -10,6 +10,14 @@ scripts/training_free/flux2_attention_mass_probe.py
 
 It works by replacing the FLUX.2 attention processors at runtime. You can use it with an editable local Diffusers checkout, and later move the same logic directly into Diffusers internals if needed.
 
+For text-heavy references, the OCR helper can generate crop specs automatically:
+
+```sh
+scripts/training_free/auto_text_crops.py
+```
+
+See [docs/auto_text_crops.md](auto_text_crops.md) for OCR setup, `--image-label`, and multi-text-region handling.
+
 ## 0. Editable Diffusers setup
 
 ```sh
@@ -112,6 +120,18 @@ python scripts/training_free/flux2_attention_mass_probe.py \
 ```
 
 This tests whether the added HR crop receives disproportionate attention mass simply because it contributes more tokens.
+
+To generate text crops automatically:
+
+```sh
+python scripts/training_free/auto_text_crops.py \
+  --image ref.png \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
+  --prompt "Change the background but preserve the small text from the reference." \
+  --run-probe
+```
 
 ## 3. Simulated group-size balancing
 
