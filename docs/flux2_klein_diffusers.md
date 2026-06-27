@@ -1,19 +1,28 @@
 # Running FLUX.2 [klein] with Diffusers
 
-This repository contains the native BFL inference implementation. For quick compatibility checks against Hugging Face Diffusers, install the optional Diffusers extra and run the smoke-test script added in `scripts/flux2_klein_diffusers.py`.
+This repository contains the native BFL inference implementation. For quick compatibility checks against Hugging Face Diffusers, install or compile an editable Diffusers checkout and run the smoke-test script added in `scripts/flux2_klein_diffusers.py`.
 
-## Install
+## Install with editable Diffusers
 
 ```sh
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[diffusers]" --extra-index-url https://download.pytorch.org/whl/cu129 --no-cache-dir
+git clone https://github.com/huggingface/diffusers
+cd diffusers
+pip install -e .
+
+cd /path/to/flux2
+pip install -e . --extra-index-url https://download.pytorch.org/whl/cu129 --no-cache-dir
 ```
 
-Alternatively, install Diffusers directly from `main`:
+If multiple Diffusers installs exist, force your editable checkout to be imported first:
 
 ```sh
-pip install git+https://github.com/huggingface/diffusers.git
+export PYTHONPATH=/path/to/diffusers/src:$PYTHONPATH
+```
+
+The optional extra is still available if you do not need to edit Diffusers internals:
+
+```sh
+pip install -e ".[diffusers]" --extra-index-url https://download.pytorch.org/whl/cu129 --no-cache-dir
 ```
 
 If your environment does not already have Hugging Face credentials, log in before running gated or rate-limited model downloads:
@@ -22,25 +31,60 @@ If your environment does not already have Hugging Face credentials, log in befor
 hf auth login
 ```
 
-## Text-to-image smoke test
+## Local model paths
+
+Both Diffusers scripts accept a local model directory:
+
+```sh
+--model-path /path/to/FLUX.2-klein-base-4B --local-files-only
+```
+
+The local directory should be a Diffusers-format checkpoint, normally containing `model_index.json` and component subfolders such as `transformer`, `vae`, `text_encoder`, and `tokenizer`. If your files are only original BFL `.safetensors` weights, use the native BFL CLI path/env-var flow instead of this Diffusers script.
+
+`--model-type` controls default sampling values:
+
+| `--model-type` | Default steps | Default guidance |
+|---|---:|---:|
+| `base` | 50 | 4.0 |
+| `distilled` | 4 | 1.0 |
+| `auto` | inferred from model path/name | inferred |
+
+For local base checkpoints whose folder name does not contain `base`, pass `--model-type base` explicitly.
+
+## Text-to-image smoke test with a local base model
 
 ```sh
 python scripts/flux2_klein_diffusers.py \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
   --prompt "A cat holding a sign that says hello world" \
   --height 1024 \
   --width 1024 \
-  --guidance-scale 1.0 \
-  --num-inference-steps 4 \
   --seed 0 \
-  --output flux-klein.png
+  --output flux-klein-base.png
 ```
 
-The script defaults to `black-forest-labs/FLUX.2-klein-4B`, `bfloat16` on CUDA/MPS, 4 inference steps, guidance scale `1.0`, and model CPU offload.
+Override base defaults when needed:
+
+```sh
+python scripts/flux2_klein_diffusers.py \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
+  --num-inference-steps 20 \
+  --guidance-scale 3.5 \
+  --prompt "A cat holding a sign that says hello world" \
+  --output flux-klein-base-fast.png
+```
 
 ## Single-reference editing smoke test
 
 ```sh
 python scripts/flux2_klein_diffusers.py \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
   --prompt "Turn the input cat into a dog" \
   --image cat.png \
   --output flux-klein-edit.png
@@ -54,6 +98,9 @@ Pass `--image` multiple times:
 
 ```sh
 python scripts/flux2_klein_diffusers.py \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
   --prompt "Combine the subjects from both references into one scene" \
   --image ref_a.png \
   --image ref_b.png \
@@ -62,10 +109,13 @@ python scripts/flux2_klein_diffusers.py \
 
 ## Training-free attention mass probe
 
-For the first reference-token-density diagnostic, use:
+For the first reference-token-density diagnostic, use the same local base path:
 
 ```sh
 python scripts/training_free/flux2_attention_mass_probe.py \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
   --prompt "Change the scene but preserve the important details from the reference." \
   --image ref.png \
   --image-label global \
@@ -78,11 +128,14 @@ See [docs/training_free_attention_mass_probe.md](training_free_attention_mass_pr
 
 ## Useful flags
 
-- `--model`: change the Hugging Face model id, for example to a 9B or base checkpoint.
+- `--model-path`: explicit local Diffusers checkpoint directory. Takes precedence over `--model`.
+- `--model`: Hugging Face model id or local Diffusers directory.
+- `--model-type`: `auto`, `base`, or `distilled`; controls default steps/guidance.
+- `--local-files-only`: pass `local_files_only=True` to Diffusers `from_pretrained`.
 - `--no-cpu-offload`: move the full pipeline to `--device` instead of using `enable_model_cpu_offload()`.
 - `--dtype`: choose `auto`, `bfloat16`, `float16`, or `float32`.
 - `--force-size-for-edit`: also pass `height` and `width` during reference-image editing.
 
 ## Why this lives behind an optional extra
 
-The native inference path in this repository should stay self-contained and reproducible. Diffusers support moves quickly, and the FLUX.2 [klein] model card recommends installing Diffusers from GitHub `main` for the `Flux2KleinPipeline`. Keeping it as an optional extra avoids forcing every native inference install to track Diffusers `main`.
+The native inference path in this repository should stay self-contained and reproducible. Diffusers support moves quickly, and the FLUX.2 [klein] model card recommends installing Diffusers for the `Flux2KleinPipeline`. Keeping it as an optional path avoids forcing every native inference install to track Diffusers `main`.
