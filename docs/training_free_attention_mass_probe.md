@@ -26,7 +26,20 @@ If you want to force the local checkout to be used first:
 export PYTHONPATH=/path/to/diffusers/src:$PYTHONPATH
 ```
 
-The FLUX.2 Klein model card recommends Diffusers for `Flux2KleinPipeline`; this probe uses that pipeline and does not modify model weights.
+## 0.1 Local base model paths
+
+The probe accepts local Diffusers-format model directories:
+
+```sh
+--model-path /path/to/FLUX.2-klein-base-4B --model-type base --local-files-only
+```
+
+The local directory should contain `model_index.json` and Diffusers component subfolders. If the folder name does not include `base`, pass `--model-type base` explicitly so the script uses base defaults:
+
+- `num_inference_steps=50`
+- `guidance_scale=4.0`
+
+You can override both with `--num-inference-steps` and `--guidance-scale` for faster diagnostics.
 
 ## 1. Baseline: whole reference only
 
@@ -34,12 +47,29 @@ Run with one reference image and record the first double-stream and first single
 
 ```sh
 python scripts/training_free/flux2_attention_mass_probe.py \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
   --prompt "Change the scene but preserve the important details from the reference." \
   --image ref.png \
   --image-label global \
   --output-dir outputs/probe_baseline \
-  --num-inference-steps 4 \
-  --guidance-scale 1.0 \
+  --seed 0
+```
+
+For faster first-pass debugging on a base model, override the steps:
+
+```sh
+python scripts/training_free/flux2_attention_mass_probe.py \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
+  --num-inference-steps 10 \
+  --guidance-scale 4.0 \
+  --prompt "Change the scene but preserve the important details from the reference." \
+  --image ref.png \
+  --image-label global \
+  --output-dir outputs/probe_baseline_fast \
   --seed 0
 ```
 
@@ -48,7 +78,7 @@ Outputs:
 - `sample.png`: generated image
 - `attention_mass.jsonl`: per-record grouped attention mass
 - `attention_mass_summary.csv`: flattened CSV summary
-- `layout.json`: text/output/ref token lengths and installed processor names
+- `layout.json`: model path, base/distilled mode, sampling values, text/output/ref token lengths, and installed processor names
 
 The most useful columns in the CSV are:
 
@@ -70,13 +100,14 @@ Example:
 
 ```sh
 python scripts/training_free/flux2_attention_mass_probe.py \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
   --prompt "Change the background but preserve the small text from the reference." \
   --image ref.png \
   --image-label global \
   --crop 0:text_hr:120,80,520,220 \
   --output-dir outputs/probe_pyramid \
-  --num-inference-steps 4 \
-  --guidance-scale 1.0 \
   --seed 0
 ```
 
@@ -88,14 +119,15 @@ This does not change the generated image. It records raw attention and also reco
 
 ```sh
 python scripts/training_free/flux2_attention_mass_probe.py \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
   --prompt "Change the background but preserve the small text from the reference." \
   --image ref.png \
   --image-label global \
   --crop 0:text_hr:120,80,520,220 \
   --simulate-group-balance \
   --output-dir outputs/probe_pyramid_sim_balance \
-  --num-inference-steps 4 \
-  --guidance-scale 1.0 \
   --seed 0
 ```
 
@@ -107,14 +139,15 @@ This applies the group-size logit correction to the real attention call. It is m
 
 ```sh
 python scripts/training_free/flux2_attention_mass_probe.py \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
   --prompt "Change the background but preserve the small text from the reference." \
   --image ref.png \
   --image-label global \
   --crop 0:text_hr:120,80,520,220 \
   --apply-group-balance \
   --output-dir outputs/probe_pyramid_apply_balance \
-  --num-inference-steps 4 \
-  --guidance-scale 1.0 \
   --seed 0
 ```
 
@@ -135,10 +168,13 @@ Record specific layers:
 
 ```sh
 python scripts/training_free/flux2_attention_mass_probe.py \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
   --image ref.png \
   --record-layer transformer_blocks.3.attn \
   --record-layer single_transformer_blocks.12.attn \
-  --max-records 16 \
+  --max-records 32 \
   --output-dir outputs/probe_layers
 ```
 
@@ -146,11 +182,16 @@ Record every attention layer until `--max-records` is hit:
 
 ```sh
 python scripts/training_free/flux2_attention_mass_probe.py \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
   --image ref.png \
   --record-all-layers \
-  --max-records 32 \
+  --max-records 64 \
   --output-dir outputs/probe_all_layers
 ```
+
+For base models with classifier-free guidance, the transformer can be called for both conditional and unconditional passes. Increase `--max-records` if you need more layers or more timesteps.
 
 ## 6. First experiment table
 
