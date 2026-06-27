@@ -124,7 +124,19 @@ python scripts/training_free/flux2_attention_mass_probe.py \
 
 The probe can add HR crop references with `--crop INDEX:LABEL:X0,Y0,X1,Y1`, record grouped attention mass, simulate group-size balancing, and optionally apply group-size balancing to the real attention call.
 
-See [docs/training_free_attention_mass_probe.md](training_free_attention_mass_probe.md) for the step-by-step baseline, reference-pyramid, simulated-balancing, and actual-balancing experiments.
+For text-heavy images, generate these crop specs automatically:
+
+```sh
+python scripts/training_free/auto_text_crops.py \
+  --image ref.png \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
+  --simulate-group-balance \
+  --run-probe
+```
+
+See [docs/training_free_attention_mass_probe.md](training_free_attention_mass_probe.md) for the step-by-step baseline, reference-pyramid, simulated-balancing, and actual-balancing experiments. See [docs/auto_text_crops.md](auto_text_crops.md) for OCR setup and multi-text-region handling.
 
 ## Useful flags
 
