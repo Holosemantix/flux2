@@ -46,3 +46,23 @@ python scripts/training_free/flux2_attention_mass_probe.py \
   --simulate-group-balance \
   --output-dir outputs/probe_pyramid_sim_balance
 ```
+
+## Automatic text crops
+
+To avoid manually entering text coordinates, install an OCR backend and let the helper generate `--crop` specs:
+
+```sh
+pip install easyocr
+
+python scripts/training_free/auto_text_crops.py \
+  --image ref.png \
+  --model-path /path/to/FLUX.2-klein-base-4B \
+  --model-type base \
+  --local-files-only \
+  --prompt "Change the background but preserve the small text from the reference." \
+  --simulate-group-balance \
+  --run-probe \
+  --probe-output-dir outputs/probe_auto_text
+```
+
+See `docs/auto_text_crops.md` for OCR options, `--image-label`, merging many text boxes, and limiting crop count.
