@@ -5,6 +5,11 @@ creates a separate `upload_chunks/` directory with many small folders. Each fold
 contains a shard of `attention_mass_summary.csv` plus small metadata files and is
 kept below a configurable byte limit, defaulting to 95,000 bytes.
 
+Chunk folder names and file names include a content prefix and chunk index, e.g.:
+
+    summary_csv_chunk_0000/summary_csv_chunk_0000_attention_mass_summary.csv
+    raw_jsonl_chunk_0000/raw_jsonl_chunk_0000_attention_mass.jsonl
+
 By default it chunks only `attention_mass_summary.csv` + `layout.json`, because
 that is usually enough for analysis. Use `--include-jsonl` to also create a
 separate set of raw JSONL chunks.
@@ -21,6 +26,9 @@ from typing import Iterable
 
 
 DEFAULT_MAX_BYTES = 95_000
+SUMMARY_PREFIX = "summary_csv"
+JSONL_PREFIX = "raw_jsonl"
+ROOT_MANIFEST_NAME = "upload_chunks_manifest.json"
 
 
 def byte_len(text: str) -> int:
@@ -39,24 +47,21 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def copy_if_fits(src: Path, dst: Path, max_bytes: int, reserved_bytes: int = 0) -> bool:
-    if not src.exists():
-        return False
-    if src.stat().st_size + reserved_bytes > max_bytes:
-        return False
-    shutil.copy2(src, dst)
-    return True
+def chunk_stem(prefix: str, idx: int) -> str:
+    return f"{prefix}_chunk_{idx:04d}"
 
 
-def make_chunk_dir(output_root: Path, group_name: str, idx: int) -> Path:
-    chunk_dir = output_root / group_name / f"chunk_{idx:04d}"
+def prefixed_filename(prefix: str, idx: int, suffix: str) -> str:
+    return f"{chunk_stem(prefix, idx)}_{suffix}"
+
+
+def make_chunk_dir(output_root: Path, group_name: str, prefix: str, idx: int) -> Path:
+    chunk_dir = output_root / group_name / chunk_stem(prefix, idx)
     chunk_dir.mkdir(parents=True, exist_ok=True)
     return chunk_dir
 
 
 def rows_to_csv_text(header: list[str], rows: list[list[str]]) -> str:
-    # csv.writer needs a file-like object. Use a tiny object backed by a list to
-    # avoid importing io repeatedly in the hot loop.
     import io
 
     buf = io.StringIO()
@@ -73,6 +78,7 @@ def split_csv(
     output_root: Path,
     max_bytes: int,
     group_name: str = "summary_chunks",
+    prefix: str = SUMMARY_PREFIX,
 ) -> list[Path]:
     if not input_csv.exists():
         raise FileNotFoundError(f"Missing CSV file: {input_csv}")
@@ -88,17 +94,26 @@ def split_csv(
             nonlocal rows, chunk_idx
             if not rows:
                 return
-            chunk_dir = make_chunk_dir(output_root, group_name, chunk_idx)
+            chunk_dir = make_chunk_dir(output_root, group_name, prefix, chunk_idx)
             csv_text = rows_to_csv_text(header, rows)
-            (chunk_dir / "attention_mass_summary.csv").write_text(csv_text, encoding="utf-8")
+            csv_name = prefixed_filename(prefix, chunk_idx, "attention_mass_summary.csv")
+            layout_name = prefixed_filename(prefix, chunk_idx, "layout.json")
+            manifest_name = prefixed_filename(prefix, chunk_idx, "manifest.json")
+
+            (chunk_dir / csv_name).write_text(csv_text, encoding="utf-8")
             if layout_text:
-                (chunk_dir / "layout.json").write_text(layout_text, encoding="utf-8")
+                (chunk_dir / layout_name).write_text(layout_text, encoding="utf-8")
             write_json(
-                chunk_dir / "manifest.json",
+                chunk_dir / manifest_name,
                 {
                     "kind": "attention_mass_summary_csv",
-                    "source_file": str(input_csv),
+                    "content_prefix": prefix,
                     "chunk_index": chunk_idx,
+                    "chunk_folder": chunk_dir.name,
+                    "data_file": csv_name,
+                    "layout_file": layout_name if layout_text else None,
+                    "manifest_file": manifest_name,
+                    "source_file": str(input_csv),
                     "num_rows": len(rows),
                     "folder_size_bytes": folder_size(chunk_dir),
                     "max_folder_bytes": max_bytes,
@@ -133,6 +148,7 @@ def split_jsonl(
     output_root: Path,
     max_bytes: int,
     group_name: str = "jsonl_chunks",
+    prefix: str = JSONL_PREFIX,
 ) -> list[Path]:
     if not input_jsonl.exists():
         raise FileNotFoundError(f"Missing JSONL file: {input_jsonl}")
@@ -146,16 +162,25 @@ def split_jsonl(
         nonlocal lines, chunk_idx
         if not lines:
             return
-        chunk_dir = make_chunk_dir(output_root, group_name, chunk_idx)
-        (chunk_dir / "attention_mass.jsonl").write_text("".join(lines), encoding="utf-8")
+        chunk_dir = make_chunk_dir(output_root, group_name, prefix, chunk_idx)
+        jsonl_name = prefixed_filename(prefix, chunk_idx, "attention_mass.jsonl")
+        layout_name = prefixed_filename(prefix, chunk_idx, "layout.json")
+        manifest_name = prefixed_filename(prefix, chunk_idx, "manifest.json")
+
+        (chunk_dir / jsonl_name).write_text("".join(lines), encoding="utf-8")
         if layout_text:
-            (chunk_dir / "layout.json").write_text(layout_text, encoding="utf-8")
+            (chunk_dir / layout_name).write_text(layout_text, encoding="utf-8")
         write_json(
-            chunk_dir / "manifest.json",
+            chunk_dir / manifest_name,
             {
                 "kind": "attention_mass_jsonl",
-                "source_file": str(input_jsonl),
+                "content_prefix": prefix,
                 "chunk_index": chunk_idx,
+                "chunk_folder": chunk_dir.name,
+                "data_file": jsonl_name,
+                "layout_file": layout_name if layout_text else None,
+                "manifest_file": manifest_name,
+                "source_file": str(input_jsonl),
                 "num_lines": len(lines),
                 "folder_size_bytes": folder_size(chunk_dir),
                 "max_folder_bytes": max_bytes,
@@ -181,6 +206,17 @@ def split_jsonl(
     return chunks
 
 
+def chunk_manifest_files(chunks: Iterable[Path], prefix: str) -> list[str]:
+    manifests: list[str] = []
+    for chunk_dir in chunks:
+        candidates = sorted(chunk_dir.glob(f"{prefix}_chunk_*_manifest.json"))
+        if candidates:
+            manifests.append(str(candidates[0]))
+        else:
+            manifests.append(str(chunk_dir))
+    return manifests
+
+
 def write_root_manifest(
     *,
     input_dir: Path,
@@ -195,16 +231,29 @@ def write_root_manifest(
         "input_dir": str(input_dir),
         "output_root": str(output_root),
         "max_folder_bytes": max_bytes,
+        "summary_content_prefix": SUMMARY_PREFIX,
+        "jsonl_content_prefix": JSONL_PREFIX,
         "summary_chunks": [str(p) for p in summary_chunks],
+        "summary_chunk_manifests": chunk_manifest_files(summary_chunks, SUMMARY_PREFIX),
         "jsonl_chunks": [str(p) for p in jsonl_chunks],
+        "jsonl_chunk_manifests": chunk_manifest_files(jsonl_chunks, JSONL_PREFIX),
         "num_summary_chunks": len(summary_chunks),
         "num_jsonl_chunks": len(jsonl_chunks),
+        "naming_rule": {
+            "folder": "<content_prefix>_chunk_<idx4>",
+            "file": "<content_prefix>_chunk_<idx4>_<original_file_role>",
+            "examples": [
+                "summary_csv_chunk_0000/summary_csv_chunk_0000_attention_mass_summary.csv",
+                "summary_csv_chunk_0000/summary_csv_chunk_0000_layout.json",
+                "raw_jsonl_chunk_0000/raw_jsonl_chunk_0000_attention_mass.jsonl",
+            ],
+        },
         "notes": [
-            "Upload folders under summary_chunks first; they contain attention_mass_summary.csv plus layout.json.",
+            "Upload folders under summary_chunks first; they contain prefixed summary CSV plus prefixed layout JSON.",
             "JSONL chunks are optional and can be large if a single record is large.",
         ],
     }
-    write_json(output_root / "manifest.json", payload)
+    write_json(output_root / ROOT_MANIFEST_NAME, payload)
 
 
 def parse_args() -> argparse.Namespace:
@@ -262,6 +311,7 @@ def main() -> None:
     )
 
     print(f"Wrote chunks under: {output_root}")
+    print(f"Root manifest: {output_root / ROOT_MANIFEST_NAME}")
     print(f"Summary chunks: {len(summary_chunks)}")
     print(f"JSONL chunks: {len(jsonl_chunks)}")
     for chunk_dir in summary_chunks[:5]:
