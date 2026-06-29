@@ -26,7 +26,7 @@ This repo contains minimal inference code to run image generation & editing with
 | [FLUX.2 [klein] 9B KV](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-kv) | ✅ | ✅ | ✅ | ✅ | ✅ | [FLUX Non-Commercial License](model_licenses/LICENSE-FLUX-NON-COMMERICAL) |
 | [FLUX.2 [klein] 4B Base](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4B) | ❌ | ❌ | ✅ | ✅ | ✅ | [apache-2.0](https://huggingface.co/datasets/choosealicense/licenses/blob/main/markdown/apache-2.0.md) |
 | [FLUX.2 [klein] 9B Base](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B) | ❌ | ❌ | ✅ | ✅ | ✅ | [FLUX Non-Commercial License](model_licenses/LICENSE-FLUX-NON-COMMERICAL) |
-| [FLUX.2 [dev]](https://huggingface.co/black-forest-labs/FLUX.2-dev) | ❌ | ✅ | ✅ | ✅ | ✅ | [FLUX Non-Commercial License](model_licenses/LICENSE-FLUX-NON-COMMERICAL) |
+| [FLUX.2 [dev]](https://huggingface.co/black-forest-labs/FLUX.2-dev) | ❌ | ✅ | ✅ | ✅ | ✅ | [FLUX Non-Commercial License](model_licenses/LICENSE-FLUX-DEV) |
 
 **All models support**: Text-to-Image ✅ | Single-ref Editing ✅ | Multi-ref Editing ✅
 
@@ -119,6 +119,17 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e . --extra-index-url https://download.pytorch.org/whl/cu129 --no-cache-dir
 ```
+
+### Optional: FLUX.2 [klein] through Diffusers
+
+For a quick Diffusers compatibility check, install the optional Diffusers extra and run the smoke-test script:
+
+```bash
+pip install -e ".[diffusers]" --extra-index-url https://download.pytorch.org/whl/cu129 --no-cache-dir
+python scripts/flux2_klein_diffusers.py --prompt "A cat holding a sign that says hello world" --output flux-klein.png
+```
+
+See [docs/flux2_klein_diffusers.md](docs/flux2_klein_diffusers.md) for text-to-image, single-reference editing, and multi-reference editing examples.
 
 ## Run the CLI
 
