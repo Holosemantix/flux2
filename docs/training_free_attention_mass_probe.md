@@ -18,6 +18,16 @@ scripts/training_free/auto_text_crops.py
 
 See [docs/auto_text_crops.md](auto_text_crops.md) for OCR setup, `--image-label`, and multi-text-region handling.
 
+If the generated result files are too large to upload, split them into small upload chunks:
+
+```sh
+python scripts/training_free/split_probe_outputs.py \
+  --input-dir results/training_free/probe_auto_text_sim_v2 \
+  --clean
+```
+
+See [docs/split_probe_outputs.md](split_probe_outputs.md) for details.
+
 ## 0. Editable Diffusers setup
 
 ```sh
