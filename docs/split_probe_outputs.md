@@ -8,24 +8,33 @@ python scripts/training_free/split_probe_outputs.py \
   --clean
 ```
 
-This writes:
+This writes prefixed folder names and prefixed file names:
 
 ```text
 results/training_free/probe_auto_text_sim_v2/upload_chunks/
-  manifest.json
+  upload_chunks_manifest.json
   summary_chunks/
-    chunk_0000/
-      attention_mass_summary.csv
-      layout.json
-      manifest.json
-    chunk_0001/
-      attention_mass_summary.csv
-      layout.json
-      manifest.json
+    summary_csv_chunk_0000/
+      summary_csv_chunk_0000_attention_mass_summary.csv
+      summary_csv_chunk_0000_layout.json
+      summary_csv_chunk_0000_manifest.json
+    summary_csv_chunk_0001/
+      summary_csv_chunk_0001_attention_mass_summary.csv
+      summary_csv_chunk_0001_layout.json
+      summary_csv_chunk_0001_manifest.json
     ...
 ```
 
-Each `summary_chunks/chunk_xxxx` folder is targeted to stay below `95,000` bytes by default. Upload these chunk folders one by one.
+The naming rule is:
+
+```text
+folder: <content_prefix>_chunk_<idx4>
+file:   <content_prefix>_chunk_<idx4>_<original_file_role>
+```
+
+For summary CSV chunks, `content_prefix=summary_csv`. For raw JSONL chunks, `content_prefix=raw_jsonl`.
+
+Each `summary_chunks/summary_csv_chunk_xxxx` folder is targeted to stay below `95,000` bytes by default. Upload these chunk folders one by one.
 
 ## Include raw JSONL chunks
 
@@ -41,8 +50,14 @@ python scripts/training_free/split_probe_outputs.py \
 This additionally creates:
 
 ```text
-upload_chunks/jsonl_chunks/chunk_0000/attention_mass.jsonl
-upload_chunks/jsonl_chunks/chunk_0001/attention_mass.jsonl
+upload_chunks/jsonl_chunks/raw_jsonl_chunk_0000/
+  raw_jsonl_chunk_0000_attention_mass.jsonl
+  raw_jsonl_chunk_0000_layout.json
+  raw_jsonl_chunk_0000_manifest.json
+upload_chunks/jsonl_chunks/raw_jsonl_chunk_0001/
+  raw_jsonl_chunk_0001_attention_mass.jsonl
+  raw_jsonl_chunk_0001_layout.json
+  raw_jsonl_chunk_0001_manifest.json
 ...
 ```
 
@@ -59,10 +74,10 @@ Use a value below the platform upload limit to leave room for metadata.
 
 ## What to upload first
 
-Upload the `summary_chunks` folders first. They contain:
+Upload the `summary_chunks/summary_csv_chunk_xxxx` folders first. They contain:
 
-- `attention_mass_summary.csv`: the shard needed for mass analysis
-- `layout.json`: copied metadata for the run
-- `manifest.json`: shard metadata
+- `summary_csv_chunk_xxxx_attention_mass_summary.csv`: the shard needed for mass analysis
+- `summary_csv_chunk_xxxx_layout.json`: copied metadata for the run
+- `summary_csv_chunk_xxxx_manifest.json`: shard metadata, including content prefix and idx
 
 Only upload `jsonl_chunks` if the summary CSV is insufficient.
